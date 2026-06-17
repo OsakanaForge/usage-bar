@@ -1,0 +1,19 @@
+{
+  "$schema": "https://schema.tauri.app/config/2",
+  "productName": "UsageBar",
+  "version": "0.1.0",
+  "identifier": "dev.local.usage-bar",
+  "build": {
+    "frontendDist": "../ui"
+  },
+  "app": {
+    "windows": []
+  },
+  "bundle": {
+    "active": true,
+    "targets": ["app"],
+    "macOS": {
+      "minimumSystemVersion": "13.0"
+    }
+  }
+}

@@ -1,0 +1,7 @@
+{
+  "$schema": "../gen/schemas/desktop-schema.json",
+  "identifier": "default",
+  "description": "No webview capabilities are required for the tray-only MVP.",
+  "windows": [],
+  "permissions": ["core:default"]
+}
