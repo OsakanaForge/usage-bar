@@ -4,7 +4,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::{
     env,
-    io::{BufRead, BufReader, Write},
+    io::{BufRead, BufReader, Read, Write},
     path::{Path, PathBuf},
     process::{Command, Stdio},
     sync::{Arc, Mutex},
@@ -33,11 +33,32 @@ impl RateLimitWindow {
     }
 }
 
-#[derive(Clone, Debug, Deserialize, Serialize)]
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct RateLimits {
     primary: Option<RateLimitWindow>,
     secondary: Option<RateLimitWindow>,
+    plan_type: Option<String>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ClaudeWindow {
+    used_percent: u8,
+    resets_label: String,
+}
+
+impl ClaudeWindow {
+    fn remaining_percent(&self) -> u8 {
+        100u8.saturating_sub(self.used_percent.min(100))
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ClaudeUsage {
+    five_hour: ClaudeWindow,
+    seven_day: ClaudeWindow,
     plan_type: Option<String>,
 }
 
@@ -63,6 +84,8 @@ struct RpcError {
 #[serde(rename_all = "camelCase")]
 struct UsageSnapshot {
     rate_limits: RateLimits,
+    #[serde(default)]
+    claude_usage: Option<ClaudeUsage>,
     fetched_at: u64,
 }
 
@@ -92,13 +115,16 @@ struct Settings {
 
 fn main() {
     if env::args().any(|argument| argument == "--probe") {
-        let result = locate_codex().and_then(|path| fetch_usage(&path));
+        let result = fetch_all_usage();
         match result {
-            Ok(snapshot) => {
+            Ok((snapshot, warning)) => {
                 println!(
                     "{}",
                     serde_json::to_string_pretty(&snapshot).expect("snapshot serialization failed")
                 );
+                if let Some(warning) = warning {
+                    eprintln!("{warning}");
+                }
                 return;
             }
             Err(error) => {
@@ -160,15 +186,15 @@ fn refresh(app: AppHandle) {
     update_tray(&app, &state);
 
     tauri::async_runtime::spawn_blocking(move || {
-        let result = locate_codex().and_then(|path| fetch_usage(&path));
+        let result = fetch_all_usage();
         {
             let mut current = state.lock().expect("monitor state lock poisoned");
             current.refreshing = false;
             match result {
-                Ok(snapshot) => {
+                Ok((snapshot, warning)) => {
                     save_cache(&snapshot);
                     current.latest = Some(snapshot);
-                    current.last_error = None;
+                    current.last_error = warning;
                 }
                 Err(error) => current.last_error = Some(error),
             }
@@ -244,6 +270,7 @@ fn fetch_usage(codex: &Path) -> Result<UsageSnapshot, String> {
                 let _ = child.wait();
                 return Ok(UsageSnapshot {
                     rate_limits: result.rate_limits,
+                    claude_usage: None,
                     fetched_at: now_epoch(),
                 });
             }
@@ -284,27 +311,297 @@ fn locate_codex() -> Result<PathBuf, String> {
         .ok_or_else(|| "Codex CLIが見つかりません".into())
 }
 
+fn fetch_all_usage() -> Result<(UsageSnapshot, Option<String>), String> {
+    let codex = locate_codex().and_then(|path| fetch_usage(&path));
+    let claude = locate_claude().and_then(|path| fetch_claude_usage(&path));
+    let mut errors = Vec::new();
+
+    let mut snapshot = match codex {
+        Ok(snapshot) => snapshot,
+        Err(error) => {
+            errors.push(error);
+            UsageSnapshot {
+                rate_limits: RateLimits::default(),
+                claude_usage: None,
+                fetched_at: now_epoch(),
+            }
+        }
+    };
+
+    match claude {
+        Ok(usage) => snapshot.claude_usage = Some(usage),
+        Err(error) => errors.push(error),
+    }
+
+    if snapshot.rate_limits.primary.is_none() && snapshot.claude_usage.is_none() {
+        return Err(errors.join(" / "));
+    }
+    let warning = (!errors.is_empty()).then(|| errors.join(" / "));
+    Ok((snapshot, warning))
+}
+
+fn locate_claude() -> Result<PathBuf, String> {
+    let mut candidates = vec![
+        PathBuf::from("/opt/homebrew/bin/claude"),
+        PathBuf::from("/usr/local/bin/claude"),
+    ];
+    if let Some(home) = env::var_os("HOME") {
+        let home = PathBuf::from(home);
+        candidates.push(home.join(".local/bin/claude"));
+        let node_versions = home.join(".nvm/versions/node");
+        if let Ok(entries) = std::fs::read_dir(node_versions) {
+            candidates.extend(
+                entries
+                    .flatten()
+                    .map(|entry| entry.path().join("bin/claude")),
+            );
+        }
+    }
+    if let Some(path) = env::var_os("PATH") {
+        candidates.extend(env::split_paths(&path).map(|directory| directory.join("claude")));
+    }
+    candidates
+        .into_iter()
+        .find(|candidate| candidate.is_file())
+        .ok_or_else(|| "Claude Code CLIが見つかりません".into())
+}
+
+fn fetch_claude_usage(claude: &Path) -> Result<ClaudeUsage, String> {
+    let probe_directory = cache_path()
+        .and_then(|path| {
+            path.parent()
+                .map(|directory| directory.join("claude-probe"))
+        })
+        .ok_or("Claude Code用ディレクトリを決定できません")?;
+    std::fs::create_dir_all(&probe_directory)
+        .map_err(|error| format!("Claude Code用ディレクトリを作成できません: {error}"))?;
+    let mut child = Command::new("/usr/bin/script")
+        .args(["-q", "/dev/null"])
+        .arg(claude)
+        .arg("--safe-mode")
+        .current_dir(probe_directory)
+        .env("TERM", "xterm-256color")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .map_err(|error| format!("Claude Codeを起動できません: {error}"))?;
+
+    let mut stdout = child
+        .stdout
+        .take()
+        .ok_or("Claude Codeの標準出力を開けません")?;
+    let captured = Arc::new(Mutex::new(Vec::new()));
+    let reader_capture = captured.clone();
+    let reader = std::thread::spawn(move || {
+        let mut chunk = [0u8; 4096];
+        while let Ok(length) = stdout.read(&mut chunk) {
+            if length == 0 {
+                break;
+            }
+            reader_capture
+                .lock()
+                .expect("Claude output lock poisoned")
+                .extend_from_slice(&chunk[..length]);
+        }
+    });
+    let mut stdin = child
+        .stdin
+        .take()
+        .ok_or("Claude Codeの標準入力を開けません")?;
+    for _ in 0..30 {
+        let startup = {
+            let captured = captured.lock().expect("Claude output lock poisoned");
+            strip_terminal_sequences(&String::from_utf8_lossy(&captured))
+        };
+        if startup.contains("safety") && startup.contains("folder") {
+            let _ = stdin.write_all(b"\r");
+            let _ = stdin.flush();
+            std::thread::sleep(Duration::from_secs(1));
+            break;
+        }
+        if startup.contains("Tips") && startup.contains("getting") {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    std::thread::sleep(Duration::from_secs(1));
+    stdin
+        .write_all(b"/usage\r")
+        .and_then(|_| stdin.flush())
+        .map_err(|error| format!("Claude Codeへ/usageを送信できません: {error}"))?;
+    std::thread::sleep(Duration::from_secs(4));
+    let _ = stdin.write_all(b"\x1b");
+    let _ = stdin.flush();
+    std::thread::sleep(Duration::from_millis(200));
+    let _ = stdin.write_all(b"/exit\r");
+    let _ = stdin.flush();
+    drop(stdin);
+
+    let deadline = std::time::Instant::now() + Duration::from_secs(8);
+    while std::time::Instant::now() < deadline {
+        if child.try_wait().ok().flatten().is_some() {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    if child.try_wait().ok().flatten().is_none() {
+        let _ = child.kill();
+        let _ = child.wait();
+    }
+
+    let _ = reader.join();
+    let output = captured.lock().expect("Claude output lock poisoned");
+    let screen = strip_terminal_sequences(&String::from_utf8_lossy(&output));
+    let mut usage = parse_claude_usage(&screen)?;
+    usage.plan_type = fetch_claude_plan(claude);
+    Ok(usage)
+}
+
+fn fetch_claude_plan(claude: &Path) -> Option<String> {
+    let output = Command::new(claude)
+        .args(["auth", "status", "--json"])
+        .output()
+        .ok()?;
+    let value: Value = serde_json::from_slice(&output.stdout).ok()?;
+    value
+        .get("subscriptionType")
+        .and_then(Value::as_str)
+        .map(str::to_string)
+}
+
+fn strip_terminal_sequences(input: &str) -> String {
+    let bytes = input.as_bytes();
+    let mut output = String::with_capacity(bytes.len());
+    let mut index = 0;
+    while index < bytes.len() {
+        if bytes[index] == 0x1b {
+            index += 1;
+            if index < bytes.len() && bytes[index] == b'[' {
+                index += 1;
+                while index < bytes.len() {
+                    let byte = bytes[index];
+                    index += 1;
+                    if (0x40..=0x7e).contains(&byte) {
+                        break;
+                    }
+                }
+                output.push(' ');
+            } else if index < bytes.len() && bytes[index] == b']' {
+                index += 1;
+                while index < bytes.len() && bytes[index] != 0x07 {
+                    index += 1;
+                }
+                index += usize::from(index < bytes.len());
+            } else {
+                index += usize::from(index < bytes.len());
+            }
+            continue;
+        }
+        let byte = bytes[index];
+        if byte == b'\r' || byte == b'\n' || byte == b'\t' {
+            output.push(' ');
+        } else if byte >= 0x20 {
+            output.push(byte as char);
+        }
+        index += 1;
+    }
+    output.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+fn parse_claude_usage(screen: &str) -> Result<ClaudeUsage, String> {
+    let usage = screen
+        .rfind("Current session")
+        .map(|index| &screen[index..])
+        .ok_or("Claude Codeの使用量画面を解析できません")?;
+    let week_index = usage
+        .find("Current week")
+        .ok_or("Claude Codeの週間使用量が見つかりません")?;
+    let session = &usage[..week_index];
+    let week = &usage[week_index..];
+
+    Ok(ClaudeUsage {
+        five_hour: ClaudeWindow {
+            used_percent: percent_before_used(session)?,
+            resets_label: session
+                .split_whitespace()
+                .find(|word| is_clock_time(word))
+                .unwrap_or("不明")
+                .to_string(),
+        },
+        seven_day: ClaudeWindow {
+            used_percent: percent_before_used(week)?,
+            resets_label: extract_week_reset(week).unwrap_or_else(|| "不明".into()),
+        },
+        plan_type: None,
+    })
+}
+
+fn percent_before_used(text: &str) -> Result<u8, String> {
+    let percent = text
+        .find('%')
+        .ok_or("Claude Codeの使用率が見つかりません")?;
+    let digits = text[..percent]
+        .chars()
+        .rev()
+        .take_while(|character| character.is_ascii_digit())
+        .collect::<String>()
+        .chars()
+        .rev()
+        .collect::<String>();
+    digits
+        .parse::<u8>()
+        .map(|value| value.min(100))
+        .map_err(|_| "Claude Codeの使用率を解析できません".into())
+}
+
+fn is_clock_time(word: &str) -> bool {
+    let word =
+        word.trim_matches(|character: char| !character.is_ascii_alphanumeric() && character != ':');
+    (word.ends_with("am") || word.ends_with("pm"))
+        && word[..word.len().saturating_sub(2)].contains(':')
+}
+
+fn extract_week_reset(text: &str) -> Option<String> {
+    const MONTHS: [&str; 12] = [
+        "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
+    ];
+    let words = text.split_whitespace().collect::<Vec<_>>();
+    let index = words.iter().position(|word| MONTHS.contains(word))?;
+    Some(words.get(index..index + 4)?.join(" "))
+}
+
 fn update_tray(app: &AppHandle, state: &SharedState) {
     let Some(tray) = app.tray_by_id(TRAY_ID) else {
         return;
     };
     let snapshot = state.lock().expect("monitor state lock poisoned");
-    let title = if snapshot.refreshing && snapshot.latest.is_none() {
-        "Codex ...".to_string()
-    } else if let Some(primary) = snapshot
-        .latest
-        .as_ref()
-        .and_then(|value| value.rate_limits.primary.as_ref())
-    {
-        format!("Codex {}%", primary.remaining_percent())
-    } else {
-        "Codex ?".to_string()
-    };
-    let remaining = snapshot
+    let codex_remaining = snapshot
         .latest
         .as_ref()
         .and_then(|value| value.rate_limits.primary.as_ref())
         .map(RateLimitWindow::remaining_percent);
+    let claude_remaining = snapshot
+        .latest
+        .as_ref()
+        .and_then(|value| value.claude_usage.as_ref())
+        .map(|usage| usage.five_hour.remaining_percent());
+    let title = if snapshot.refreshing && snapshot.latest.is_none() {
+        "Usage ...".to_string()
+    } else {
+        let mut parts = Vec::new();
+        if let Some(remaining) = codex_remaining {
+            parts.push(format!("Codex {remaining}%"));
+        }
+        if let Some(remaining) = claude_remaining {
+            parts.push(format!("Claude {remaining}%"));
+        }
+        if parts.is_empty() {
+            "Usage ?".to_string()
+        } else {
+            parts.join(" · ")
+        }
+    };
     match snapshot.display_mode {
         DisplayMode::Number => {
             let _ = tray.set_icon(None);
@@ -312,7 +609,11 @@ fn update_tray(app: &AppHandle, state: &SharedState) {
         }
         DisplayMode::Circle => {
             let _ = tray.set_title(Some(""));
-            let _ = tray.set_icon(Some(circle_icon(remaining.unwrap_or(0))));
+            let percentages = [codex_remaining, claude_remaining]
+                .into_iter()
+                .flatten()
+                .collect::<Vec<_>>();
+            let _ = tray.set_icon(Some(circle_icon(&percentages)));
             let _ = tray.set_icon_as_template(true);
         }
     }
@@ -339,6 +640,28 @@ fn build_menu(app: &AppHandle, state: &SharedState) -> tauri::Result<Menu<tauri:
         }
         items.push(Box::new(disabled_item(app, "状態: 正確")?));
         if let Some(plan) = &snapshot.rate_limits.plan_type {
+            items.push(Box::new(disabled_item(
+                app,
+                &format!("プラン: {}", plan.to_uppercase()),
+            )?));
+        }
+    } else {
+        items.push(Box::new(disabled_item(app, "残量: 不明")?));
+    }
+
+    items.push(Box::new(PredefinedMenuItem::separator(app)?));
+    items.push(Box::new(disabled_item(app, "Claude Code")?));
+    if state.refreshing {
+        items.push(Box::new(disabled_item(app, "更新中...")?));
+    } else if let Some(usage) = state
+        .latest
+        .as_ref()
+        .and_then(|snapshot| snapshot.claude_usage.as_ref())
+    {
+        add_claude_window_items(app, &mut items, "5時間", &usage.five_hour)?;
+        add_claude_window_items(app, &mut items, "週間", &usage.seven_day)?;
+        items.push(Box::new(disabled_item(app, "状態: 正確")?));
+        if let Some(plan) = &usage.plan_type {
             items.push(Box::new(disabled_item(
                 app,
                 &format!("プラン: {}", plan.to_uppercase()),
@@ -420,6 +743,27 @@ fn add_window_items(
     Ok(())
 }
 
+fn add_claude_window_items(
+    app: &AppHandle,
+    items: &mut Vec<Box<dyn tauri::menu::IsMenuItem<tauri::Wry>>>,
+    label: &str,
+    window: &ClaudeWindow,
+) -> tauri::Result<()> {
+    items.push(Box::new(disabled_item(
+        app,
+        &format!("{label}残量: {}%", window.remaining_percent()),
+    )?));
+    items.push(Box::new(disabled_item(
+        app,
+        &format!("  使用: {}%", window.used_percent),
+    )?));
+    items.push(Box::new(disabled_item(
+        app,
+        &format!("  リセット: {}", window.resets_label),
+    )?));
+    Ok(())
+}
+
 fn disabled_item(app: &AppHandle, label: &str) -> tauri::Result<MenuItem<tauri::Wry>> {
     MenuItem::new(app, label, false, None::<&str>)
 }
@@ -434,39 +778,48 @@ fn set_display_mode(app: &AppHandle, display_mode: DisplayMode) {
     update_tray(app, &state);
 }
 
-fn circle_icon(remaining_percent: u8) -> Image<'static> {
+fn circle_icon(remaining_percentages: &[u8]) -> Image<'static> {
     const SIZE: u32 = 32;
     const SAMPLES: u32 = 4;
-    const CENTER: f64 = 16.0;
-    let progress = f64::from(remaining_percent.clamp(0, 100)) / 100.0;
-    let mut rgba = vec![0; (SIZE * SIZE * 4) as usize];
+    let count = remaining_percentages.len().max(1) as u32;
+    let width = SIZE * count;
+    let mut rgba = vec![0; (width * SIZE * 4) as usize];
 
-    for y in 0..SIZE {
-        for x in 0..SIZE {
-            let mut alpha = 0u32;
-            for sample_y in 0..SAMPLES {
-                for sample_x in 0..SAMPLES {
-                    let px = f64::from(x) + (f64::from(sample_x) + 0.5) / f64::from(SAMPLES);
-                    let py = f64::from(y) + (f64::from(sample_y) + 0.5) / f64::from(SAMPLES);
-                    let dx = px - CENTER;
-                    let dy = py - CENTER;
-                    let distance = (dx * dx + dy * dy).sqrt();
-                    if (10.0..=14.0).contains(&distance) {
-                        let angle = dx.atan2(-dy).rem_euclid(std::f64::consts::TAU);
-                        alpha += if angle <= progress * std::f64::consts::TAU {
-                            255
-                        } else {
-                            55
-                        };
+    for (ring, remaining_percent) in remaining_percentages
+        .iter()
+        .copied()
+        .chain((remaining_percentages.is_empty()).then_some(0))
+        .enumerate()
+    {
+        let center_x = ring as f64 * f64::from(SIZE) + 16.0;
+        let progress = f64::from(remaining_percent.clamp(0, 100)) / 100.0;
+        for y in 0..SIZE {
+            for x in ring as u32 * SIZE..(ring as u32 + 1) * SIZE {
+                let mut alpha = 0u32;
+                for sample_y in 0..SAMPLES {
+                    for sample_x in 0..SAMPLES {
+                        let px = f64::from(x) + (f64::from(sample_x) + 0.5) / f64::from(SAMPLES);
+                        let py = f64::from(y) + (f64::from(sample_y) + 0.5) / f64::from(SAMPLES);
+                        let dx = px - center_x;
+                        let dy = py - 16.0;
+                        let distance = (dx * dx + dy * dy).sqrt();
+                        if (10.0..=14.0).contains(&distance) {
+                            let angle = dx.atan2(-dy).rem_euclid(std::f64::consts::TAU);
+                            alpha += if angle <= progress * std::f64::consts::TAU {
+                                255
+                            } else {
+                                55
+                            };
+                        }
                     }
                 }
+                let index = ((y * width + x) * 4 + 3) as usize;
+                rgba[index] = (alpha / (SAMPLES * SAMPLES)) as u8;
             }
-            let index = ((y * SIZE + x) * 4 + 3) as usize;
-            rgba[index] = (alpha / (SAMPLES * SAMPLES)) as u8;
         }
     }
 
-    Image::new_owned(rgba, SIZE, SIZE)
+    Image::new_owned(rgba, width, SIZE)
 }
 
 fn format_reset_time(timestamp: u64) -> String {
@@ -582,9 +935,21 @@ mod tests {
 
     #[test]
     fn circle_icon_has_expected_dimensions() {
-        let icon = circle_icon(50);
-        assert_eq!(icon.width(), 32);
+        let icon = circle_icon(&[50, 75]);
+        assert_eq!(icon.width(), 64);
         assert_eq!(icon.height(), 32);
-        assert_eq!(icon.rgba().len(), 32 * 32 * 4);
+        assert_eq!(icon.rgba().len(), 64 * 32 * 4);
+    }
+
+    #[test]
+    fn parses_claude_usage_screen() {
+        let usage = parse_claude_usage(
+            "Current session 15% used Resets 6:10am (Asia/Tokyo) Current week (all models) 28% used Resets Jun 24 at 9am (Asia/Tokyo)",
+        )
+        .unwrap();
+        assert_eq!(usage.five_hour.remaining_percent(), 85);
+        assert_eq!(usage.five_hour.resets_label, "6:10am");
+        assert_eq!(usage.seven_day.remaining_percent(), 72);
+        assert_eq!(usage.seven_day.resets_label, "Jun 24 at 9am");
     }
 }
