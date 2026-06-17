@@ -155,11 +155,6 @@ fn main() {
                     "refresh" => refresh(app.clone()),
                     "display-number" => set_display_mode(app, DisplayMode::Number),
                     "display-circle" => set_display_mode(app, DisplayMode::Circle),
-                    "open-usage" => {
-                        let _ = Command::new("/usr/bin/open")
-                            .arg("https://chatgpt.com/codex/settings/usage")
-                            .spawn();
-                    }
                     "quit" => app.exit(0),
                     _ => {}
                 })
@@ -700,13 +695,6 @@ fn build_menu(app: &AppHandle, state: &SharedState) -> tauri::Result<Menu<tauri:
         "refresh",
         "今すぐ更新",
         !state.refreshing,
-        None::<&str>,
-    )?));
-    items.push(Box::new(MenuItem::with_id(
-        app,
-        "open-usage",
-        "Codex使用状況を開く",
-        true,
         None::<&str>,
     )?));
     items.push(Box::new(PredefinedMenuItem::separator(app)?));
