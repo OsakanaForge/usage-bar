@@ -95,7 +95,11 @@ struct MonitorState {
     last_error: Option<String>,
     refreshing: bool,
     display_mode: DisplayMode,
-    refresh_interval_minutes: u64,
+    refresh_interval_seconds: u64,
+    codex_threshold: u8,
+    claude_threshold: u8,
+    codex_notified: bool,
+    claude_notified: bool,
 }
 
 type SharedState = Arc<Mutex<MonitorState>>;
@@ -113,14 +117,18 @@ enum DisplayMode {
 #[serde(rename_all = "camelCase")]
 struct Settings {
     display_mode: DisplayMode,
-    refresh_interval_minutes: u64,
+    refresh_interval_seconds: u64,
+    codex_threshold: u8,
+    claude_threshold: u8,
 }
 
 impl Default for Settings {
     fn default() -> Self {
         Self {
             display_mode: DisplayMode::Number,
-            refresh_interval_minutes: 5,
+            refresh_interval_seconds: 60,
+            codex_threshold: 0,
+            claude_threshold: 0,
         }
     }
 }
@@ -148,6 +156,7 @@ fn main() {
     }
 
     tauri::Builder::default()
+        .plugin(tauri_plugin_notification::init())
         .invoke_handler(tauri::generate_handler![get_settings, set_settings])
         .on_window_event(|window, event| {
             if window.label() == "settings"
@@ -165,10 +174,15 @@ fn main() {
             let state = Arc::new(Mutex::new(MonitorState {
                 latest: load_cache(),
                 display_mode: settings.display_mode,
-                refresh_interval_minutes: settings.refresh_interval_minutes,
+                refresh_interval_seconds: settings.refresh_interval_seconds,
+                codex_threshold: settings.codex_threshold,
+                claude_threshold: settings.claude_threshold,
                 ..MonitorState::default()
             }));
             app.manage(state.clone());
+
+            use tauri_plugin_notification::NotificationExt;
+            let _ = app.notification().request_permission();
 
             let initial_menu = build_menu(app.handle(), &state)?;
             TrayIconBuilder::with_id(TRAY_ID)
@@ -208,7 +222,7 @@ fn refresh(app: AppHandle) {
 
     tauri::async_runtime::spawn_blocking(move || {
         let result = fetch_all_usage();
-        {
+        let notifications = {
             let mut current = state.lock().expect("monitor state lock poisoned");
             current.refreshing = false;
             match result {
@@ -216,12 +230,83 @@ fn refresh(app: AppHandle) {
                     save_cache(&snapshot);
                     current.latest = Some(snapshot);
                     current.last_error = warning;
+                    pending_notifications(&mut current)
                 }
-                Err(error) => current.last_error = Some(error),
+                Err(error) => {
+                    current.last_error = Some(error);
+                    Vec::new()
+                }
             }
+        };
+        for (title, body) in notifications {
+            send_notification(&app, &title, &body);
         }
         update_tray(&app, &state);
     });
+}
+
+fn pending_notifications(state: &mut MonitorState) -> Vec<(String, String)> {
+    let Some(snapshot) = state.latest.as_ref() else {
+        return Vec::new();
+    };
+    let codex_remaining = snapshot
+        .rate_limits
+        .primary
+        .as_ref()
+        .map(RateLimitWindow::remaining_percent);
+    let claude_remaining = snapshot
+        .claude_usage
+        .as_ref()
+        .map(|usage| usage.five_hour.remaining_percent());
+
+    let mut out = Vec::new();
+    check_threshold(
+        "Codex",
+        codex_remaining,
+        state.codex_threshold,
+        &mut state.codex_notified,
+        &mut out,
+    );
+    check_threshold(
+        "Claude",
+        claude_remaining,
+        state.claude_threshold,
+        &mut state.claude_notified,
+        &mut out,
+    );
+    out
+}
+
+fn check_threshold(
+    name: &str,
+    remaining: Option<u8>,
+    threshold: u8,
+    notified: &mut bool,
+    out: &mut Vec<(String, String)>,
+) {
+    if threshold == 0 {
+        *notified = false;
+        return;
+    }
+    let Some(remaining) = remaining else {
+        return;
+    };
+    if remaining <= threshold {
+        if !*notified {
+            *notified = true;
+            out.push((
+                "UsageBar".to_string(),
+                format!("{name}の残りが{remaining}%になりました（しきい値{threshold}%）"),
+            ));
+        }
+    } else {
+        *notified = false;
+    }
+}
+
+fn send_notification(app: &AppHandle, title: &str, body: &str) {
+    use tauri_plugin_notification::NotificationExt;
+    let _ = app.notification().builder().title(title).body(body).show();
 }
 
 fn start_periodic_refresh(app: AppHandle) {
@@ -234,9 +319,8 @@ fn start_periodic_refresh(app: AppHandle) {
                 .state::<SharedState>()
                 .lock()
                 .expect("monitor state lock poisoned")
-                .refresh_interval_minutes
-                .clamp(1, 60)
-                * 60;
+                .refresh_interval_seconds
+                .clamp(5, 300);
             if elapsed_seconds >= interval_seconds {
                 elapsed_seconds = 0;
                 refresh(app.clone());
@@ -791,7 +875,7 @@ fn show_settings_window(app: &AppHandle) {
     }
     let _ = WebviewWindowBuilder::new(app, "settings", WebviewUrl::App("index.html".into()))
         .title("UsageBar設定")
-        .inner_size(440.0, 390.0)
+        .inner_size(470.0, 540.0)
         .resizable(false)
         .center()
         .build();
@@ -802,7 +886,9 @@ fn get_settings(state: tauri::State<'_, SharedState>) -> Settings {
     let current = state.lock().expect("monitor state lock poisoned");
     Settings {
         display_mode: current.display_mode,
-        refresh_interval_minutes: current.refresh_interval_minutes,
+        refresh_interval_seconds: current.refresh_interval_seconds,
+        codex_threshold: current.codex_threshold,
+        claude_threshold: current.claude_threshold,
     }
 }
 
@@ -812,13 +898,24 @@ fn set_settings(
     state: tauri::State<'_, SharedState>,
     settings: Settings,
 ) -> Result<(), String> {
-    if !(1..=60).contains(&settings.refresh_interval_minutes) {
-        return Err("更新間隔は1〜60分で指定してください".into());
+    if !(5..=300).contains(&settings.refresh_interval_seconds) {
+        return Err("更新間隔は5〜300秒で指定してください".into());
+    }
+    if settings.codex_threshold > 100 || settings.claude_threshold > 100 {
+        return Err("しきい値は0〜100%で指定してください".into());
     }
     {
         let mut current = state.lock().expect("monitor state lock poisoned");
         current.display_mode = settings.display_mode;
-        current.refresh_interval_minutes = settings.refresh_interval_minutes;
+        current.refresh_interval_seconds = settings.refresh_interval_seconds;
+        if current.codex_threshold != settings.codex_threshold {
+            current.codex_threshold = settings.codex_threshold;
+            current.codex_notified = false;
+        }
+        if current.claude_threshold != settings.claude_threshold {
+            current.claude_threshold = settings.claude_threshold;
+            current.claude_notified = false;
+        }
     }
     persist_settings(&settings);
     update_tray(&app, state.inner());
@@ -1004,6 +1101,36 @@ mod tests {
     fn old_settings_receive_default_refresh_interval() {
         let settings: Settings = serde_json::from_str(r#"{"displayMode":"circle"}"#).unwrap();
         assert_eq!(settings.display_mode, DisplayMode::Circle);
-        assert_eq!(settings.refresh_interval_minutes, 5);
+        assert_eq!(settings.refresh_interval_seconds, 60);
+        assert_eq!(settings.codex_threshold, 0);
+        assert_eq!(settings.claude_threshold, 0);
+    }
+
+    #[test]
+    fn threshold_notifies_once_until_recovery() {
+        let mut out = Vec::new();
+        let mut notified = false;
+
+        check_threshold("Codex", Some(15), 20, &mut notified, &mut out);
+        assert_eq!(out.len(), 1);
+        assert!(notified);
+
+        check_threshold("Codex", Some(12), 20, &mut notified, &mut out);
+        assert_eq!(out.len(), 1, "should not re-notify while still below");
+
+        check_threshold("Codex", Some(50), 20, &mut notified, &mut out);
+        assert!(!notified, "recovering above threshold resets the flag");
+
+        check_threshold("Codex", Some(10), 20, &mut notified, &mut out);
+        assert_eq!(out.len(), 2, "notifies again after recovery");
+    }
+
+    #[test]
+    fn threshold_zero_disables_notifications() {
+        let mut out = Vec::new();
+        let mut notified = false;
+        check_threshold("Claude", Some(0), 0, &mut notified, &mut out);
+        assert!(out.is_empty());
+        assert!(!notified);
     }
 }

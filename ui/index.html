@@ -92,6 +92,42 @@
         font: inherit;
       }
 
+      .thresholds {
+        display: flex;
+        gap: 14px;
+      }
+
+      .threshold {
+        display: flex;
+        align-items: center;
+        gap: 5px;
+      }
+
+      .threshold-name {
+        min-width: 38px;
+        color: #6e6e73;
+      }
+
+      .threshold input {
+        width: 50px;
+        height: 29px;
+        padding: 0 7px;
+        border: 1px solid rgba(0, 0, 0, 0.22);
+        border-radius: 6px;
+        color: inherit;
+        background: rgba(255, 255, 255, 0.9);
+        font: inherit;
+        text-align: right;
+      }
+
+      .threshold .unit { color: #6e6e73; }
+
+      .hint {
+        margin: 12px 2px 0;
+        color: #6e6e73;
+        line-height: 1.4;
+      }
+
       .source-note {
         display: flex;
         align-items: center;
@@ -139,7 +175,8 @@
       @media (prefers-color-scheme: dark) {
         :root { color: #f5f5f7; background: #252525; }
         body { background: linear-gradient(180deg, #303030 0%, #252525 100%); }
-        .subtitle, #message, .source-note { color: #a9a9ae; }
+        .subtitle, #message, .source-note, .hint, .threshold-name, .threshold .unit { color: #a9a9ae; }
+        .threshold input { border-color: rgba(255, 255, 255, 0.2); background: #4b4b4b; }
         .panel {
           border-color: rgba(255, 255, 255, 0.13);
           background: rgba(55, 55, 55, 0.86);
@@ -168,15 +205,31 @@
         <label class="row">
           <span class="label">自動更新</span>
           <select id="refreshInterval">
-            <option value="1">1分ごと</option>
-            <option value="5">5分ごと</option>
-            <option value="10">10分ごと</option>
-            <option value="15">15分ごと</option>
-            <option value="30">30分ごと</option>
-            <option value="60">60分ごと</option>
+            <option value="5">5秒ごと</option>
+            <option value="10">10秒ごと</option>
+            <option value="30">30秒ごと</option>
+            <option value="60">60秒ごと</option>
+            <option value="300">5分ごと</option>
           </select>
         </label>
+        <div class="row">
+          <span class="label">通知しきい値</span>
+          <div class="thresholds">
+            <label class="threshold">
+              <span class="threshold-name">Codex</span>
+              <input id="codexThreshold" type="number" min="0" max="100" step="1" inputmode="numeric" />
+              <span class="unit">%</span>
+            </label>
+            <label class="threshold">
+              <span class="threshold-name">Claude</span>
+              <input id="claudeThreshold" type="number" min="0" max="100" step="1" inputmode="numeric" />
+              <span class="unit">%</span>
+            </label>
+          </div>
+        </div>
       </section>
+
+      <p class="hint">残量がしきい値以下になると通知します。0で通知オフ。</p>
 
       <div class="source-note">
         <span class="status-dot" aria-hidden="true"></span>
@@ -185,7 +238,7 @@
 
       <footer>
         <span id="message" role="status"></span>
-        <button class="save" id="save" type="button">保存</button>
+        <button class="save" id="save" type="button">適用</button>
       </footer>
     </main>
 
@@ -193,9 +246,15 @@
       const invoke = window.__TAURI__?.core?.invoke;
       const segments = [...document.querySelectorAll(".segment")];
       const interval = document.querySelector("#refreshInterval");
+      const codexThreshold = document.querySelector("#codexThreshold");
+      const claudeThreshold = document.querySelector("#claudeThreshold");
       const saveButton = document.querySelector("#save");
       const message = document.querySelector("#message");
       let displayMode = "number";
+
+      function clampThreshold(value) {
+        return Math.min(100, Math.max(0, Math.round(Number(value) || 0)));
+      }
 
       function selectMode(mode) {
         displayMode = mode;
@@ -213,7 +272,9 @@
         try {
           const settings = await invoke("get_settings");
           selectMode(settings.displayMode);
-          interval.value = String(settings.refreshIntervalMinutes);
+          interval.value = String(settings.refreshIntervalSeconds);
+          codexThreshold.value = String(settings.codexThreshold);
+          claudeThreshold.value = String(settings.claudeThreshold);
         } catch (error) {
           message.textContent = String(error);
           message.classList.add("error");
@@ -223,16 +284,18 @@
       saveButton.addEventListener("click", async () => {
         if (!invoke) return;
         saveButton.disabled = true;
-        message.textContent = "保存中…";
+        message.textContent = "適用中…";
         message.classList.remove("error");
         try {
           await invoke("set_settings", {
             settings: {
               displayMode,
-              refreshIntervalMinutes: Number(interval.value),
+              refreshIntervalSeconds: Number(interval.value),
+              codexThreshold: clampThreshold(codexThreshold.value),
+              claudeThreshold: clampThreshold(claudeThreshold.value),
             },
           });
-          message.textContent = "保存しました";
+          message.textContent = "適用しました";
         } catch (error) {
           message.textContent = String(error);
           message.classList.add("error");
