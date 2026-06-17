@@ -149,6 +149,14 @@ fn main() {
 
     tauri::Builder::default()
         .invoke_handler(tauri::generate_handler![get_settings, set_settings])
+        .on_window_event(|window, event| {
+            if window.label() == "settings"
+                && let tauri::WindowEvent::CloseRequested { api, .. } = event
+            {
+                api.prevent_close();
+                let _ = window.hide();
+            }
+        })
         .setup(move |app| {
             #[cfg(target_os = "macos")]
             app.set_activation_policy(tauri::ActivationPolicy::Accessory);
