@@ -1,7 +1,7 @@
 {
   "$schema": "../gen/schemas/desktop-schema.json",
   "identifier": "default",
-  "description": "No webview capabilities are required for the tray-only MVP.",
-  "windows": [],
+  "description": "Core capabilities for the UsageBar settings window.",
+  "windows": ["settings"],
   "permissions": ["core:default"]
 }

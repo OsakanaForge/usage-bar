@@ -11,9 +11,9 @@ use std::{
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 use tauri::{
-    AppHandle, Manager,
+    AppHandle, Manager, WebviewUrl, WebviewWindowBuilder,
     image::Image,
-    menu::{CheckMenuItem, Menu, MenuItem, PredefinedMenuItem},
+    menu::{Menu, MenuItem, PredefinedMenuItem},
     tray::TrayIconBuilder,
 };
 
@@ -95,6 +95,7 @@ struct MonitorState {
     last_error: Option<String>,
     refreshing: bool,
     display_mode: DisplayMode,
+    refresh_interval_minutes: u64,
 }
 
 type SharedState = Arc<Mutex<MonitorState>>;
@@ -107,13 +108,25 @@ enum DisplayMode {
     Circle,
 }
 
-#[derive(Default, Deserialize, Serialize)]
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(default)]
 #[serde(rename_all = "camelCase")]
 struct Settings {
     display_mode: DisplayMode,
+    refresh_interval_minutes: u64,
+}
+
+impl Default for Settings {
+    fn default() -> Self {
+        Self {
+            display_mode: DisplayMode::Number,
+            refresh_interval_minutes: 5,
+        }
+    }
 }
 
 fn main() {
+    let show_settings_on_launch = env::args().any(|argument| argument == "--settings");
     if env::args().any(|argument| argument == "--probe") {
         let result = fetch_all_usage();
         match result {
@@ -135,13 +148,16 @@ fn main() {
     }
 
     tauri::Builder::default()
-        .setup(|app| {
+        .invoke_handler(tauri::generate_handler![get_settings, set_settings])
+        .setup(move |app| {
             #[cfg(target_os = "macos")]
             app.set_activation_policy(tauri::ActivationPolicy::Accessory);
 
+            let settings = load_settings();
             let state = Arc::new(Mutex::new(MonitorState {
                 latest: load_cache(),
-                display_mode: load_settings().display_mode,
+                display_mode: settings.display_mode,
+                refresh_interval_minutes: settings.refresh_interval_minutes,
                 ..MonitorState::default()
             }));
             app.manage(state.clone());
@@ -153,8 +169,7 @@ fn main() {
                 .menu(&initial_menu)
                 .on_menu_event(|app, event| match event.id.as_ref() {
                     "refresh" => refresh(app.clone()),
-                    "display-number" => set_display_mode(app, DisplayMode::Number),
-                    "display-circle" => set_display_mode(app, DisplayMode::Circle),
+                    "settings" => show_settings_window(app),
                     "quit" => app.exit(0),
                     _ => {}
                 })
@@ -162,6 +177,9 @@ fn main() {
 
             refresh(app.handle().clone());
             start_periodic_refresh(app.handle().clone());
+            if show_settings_on_launch {
+                show_settings_window(app.handle());
+            }
             Ok(())
         })
         .run(tauri::generate_context!())
@@ -200,9 +218,21 @@ fn refresh(app: AppHandle) {
 
 fn start_periodic_refresh(app: AppHandle) {
     std::thread::spawn(move || {
+        let mut elapsed_seconds = 0u64;
         loop {
-            std::thread::sleep(Duration::from_secs(300));
-            refresh(app.clone());
+            std::thread::sleep(Duration::from_secs(1));
+            elapsed_seconds += 1;
+            let interval_seconds = app
+                .state::<SharedState>()
+                .lock()
+                .expect("monitor state lock poisoned")
+                .refresh_interval_minutes
+                .clamp(1, 60)
+                * 60;
+            if elapsed_seconds >= interval_seconds {
+                elapsed_seconds = 0;
+                refresh(app.clone());
+            }
         }
     });
 }
@@ -672,29 +702,18 @@ fn build_menu(app: &AppHandle, state: &SharedState) -> tauri::Result<Menu<tauri:
     }
 
     items.push(Box::new(PredefinedMenuItem::separator(app)?));
-    items.push(Box::new(disabled_item(app, "表示形式")?));
-    items.push(Box::new(CheckMenuItem::with_id(
-        app,
-        "display-number",
-        "数字",
-        true,
-        state.display_mode == DisplayMode::Number,
-        None::<&str>,
-    )?));
-    items.push(Box::new(CheckMenuItem::with_id(
-        app,
-        "display-circle",
-        "サークル",
-        true,
-        state.display_mode == DisplayMode::Circle,
-        None::<&str>,
-    )?));
-    items.push(Box::new(PredefinedMenuItem::separator(app)?));
     items.push(Box::new(MenuItem::with_id(
         app,
         "refresh",
         "今すぐ更新",
         !state.refreshing,
+        None::<&str>,
+    )?));
+    items.push(Box::new(MenuItem::with_id(
+        app,
+        "settings",
+        "設定…",
+        true,
         None::<&str>,
     )?));
     items.push(Box::new(PredefinedMenuItem::separator(app)?));
@@ -756,14 +775,46 @@ fn disabled_item(app: &AppHandle, label: &str) -> tauri::Result<MenuItem<tauri::
     MenuItem::new(app, label, false, None::<&str>)
 }
 
-fn set_display_mode(app: &AppHandle, display_mode: DisplayMode) {
-    let state = app.state::<SharedState>().inner().clone();
+fn show_settings_window(app: &AppHandle) {
+    if let Some(window) = app.get_webview_window("settings") {
+        let _ = window.show();
+        let _ = window.set_focus();
+        return;
+    }
+    let _ = WebviewWindowBuilder::new(app, "settings", WebviewUrl::App("index.html".into()))
+        .title("UsageBar設定")
+        .inner_size(440.0, 390.0)
+        .resizable(false)
+        .center()
+        .build();
+}
+
+#[tauri::command]
+fn get_settings(state: tauri::State<'_, SharedState>) -> Settings {
+    let current = state.lock().expect("monitor state lock poisoned");
+    Settings {
+        display_mode: current.display_mode,
+        refresh_interval_minutes: current.refresh_interval_minutes,
+    }
+}
+
+#[tauri::command]
+fn set_settings(
+    app: AppHandle,
+    state: tauri::State<'_, SharedState>,
+    settings: Settings,
+) -> Result<(), String> {
+    if !(1..=60).contains(&settings.refresh_interval_minutes) {
+        return Err("更新間隔は1〜60分で指定してください".into());
+    }
     {
         let mut current = state.lock().expect("monitor state lock poisoned");
-        current.display_mode = display_mode;
+        current.display_mode = settings.display_mode;
+        current.refresh_interval_minutes = settings.refresh_interval_minutes;
     }
-    save_settings(&Settings { display_mode });
-    update_tray(app, &state);
+    persist_settings(&settings);
+    update_tray(&app, state.inner());
+    Ok(())
 }
 
 fn circle_icon(remaining_percentages: &[u8]) -> Image<'static> {
@@ -837,7 +888,7 @@ fn settings_path() -> Option<PathBuf> {
         .map(|home| PathBuf::from(home).join("Library/Application Support/UsageBar/settings.json"))
 }
 
-fn save_settings(settings: &Settings) {
+fn persist_settings(settings: &Settings) {
     let Some(path) = settings_path() else { return };
     let Some(directory) = path.parent() else {
         return;
@@ -939,5 +990,12 @@ mod tests {
         assert_eq!(usage.five_hour.resets_label, "6:10am");
         assert_eq!(usage.seven_day.remaining_percent(), 72);
         assert_eq!(usage.seven_day.resets_label, "Jun 24 at 9am");
+    }
+
+    #[test]
+    fn old_settings_receive_default_refresh_interval() {
+        let settings: Settings = serde_json::from_str(r#"{"displayMode":"circle"}"#).unwrap();
+        assert_eq!(settings.display_mode, DisplayMode::Circle);
+        assert_eq!(settings.refresh_interval_minutes, 5);
     }
 }

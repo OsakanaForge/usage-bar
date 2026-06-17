@@ -13,6 +13,9 @@ npm run tauri dev
 メニューバーに `Codex 94% · Claude 96%` の形式で5時間枠の残量が表示されます。
 クリックすると週間残量、リセット時刻、プラン、取得状態を確認できます。
 
+トレイメニューの「設定…」では、メニューバーの表示形式と自動更新間隔を変更できます。
+設定は `~/Library/Application Support/UsageBar/settings.json` に保存されます。
+
 ## 取得方法
 
 アプリはローカルの `codex app-server` を起動し、JSON-RPCの
