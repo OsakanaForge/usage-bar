@@ -430,7 +430,7 @@ fn locate_codex() -> Result<PathBuf, String> {
 
 fn fetch_all_usage() -> Result<(UsageSnapshot, Option<String>), String> {
     let codex = locate_codex().and_then(|path| fetch_usage(&path));
-    let claude = locate_claude().and_then(|path| fetch_claude_usage(&path));
+    let claude = locate_claude().and_then(|path| fetch_claude_usage_with_retry(&path));
     let mut errors = Vec::new();
 
     let mut snapshot = match codex {
@@ -481,6 +481,23 @@ fn locate_claude() -> Result<PathBuf, String> {
         .into_iter()
         .find(|candidate| candidate.is_file())
         .ok_or_else(|| "Claude Code CLIが見つかりません".into())
+}
+
+fn fetch_claude_usage_with_retry(claude: &Path) -> Result<ClaudeUsage, String> {
+    const ATTEMPTS: usize = 3;
+    let mut last_error = String::new();
+    for attempt in 0..ATTEMPTS {
+        match fetch_claude_usage(claude) {
+            Ok(usage) => return Ok(usage),
+            Err(error) => {
+                last_error = error;
+                if attempt + 1 < ATTEMPTS {
+                    std::thread::sleep(Duration::from_secs(1));
+                }
+            }
+        }
+    }
+    Err(last_error)
 }
 
 fn fetch_claude_usage(claude: &Path) -> Result<ClaudeUsage, String> {
@@ -547,7 +564,22 @@ fn fetch_claude_usage(claude: &Path) -> Result<ClaudeUsage, String> {
         .write_all(b"/usage\r")
         .and_then(|_| stdin.flush())
         .map_err(|error| format!("Claude Codeへ/usageを送信できません: {error}"))?;
-    std::thread::sleep(Duration::from_secs(4));
+    // 使用量画面の描画は /usage 実行後にサーバーへ問い合わせるため遅れることがある。
+    // 固定待ちだと遅いネット/マシンで取りこぼすので、必要な見出しが揃うまでポーリングする。
+    let usage_deadline = std::time::Instant::now() + Duration::from_secs(15);
+    loop {
+        let screen = {
+            let captured = captured.lock().expect("Claude output lock poisoned");
+            strip_terminal_sequences(&String::from_utf8_lossy(&captured))
+        };
+        if screen.contains("Current session") && screen.contains("Current week") {
+            break;
+        }
+        if std::time::Instant::now() >= usage_deadline {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(200));
+    }
     let _ = stdin.write_all(b"\x1b");
     let _ = stdin.flush();
     std::thread::sleep(Duration::from_millis(200));
