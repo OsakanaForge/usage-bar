@@ -100,6 +100,8 @@ struct MonitorState {
     claude_threshold: u8,
     codex_notified: bool,
     claude_notified: bool,
+    codex_enabled: bool,
+    claude_enabled: bool,
 }
 
 type SharedState = Arc<Mutex<MonitorState>>;
@@ -120,6 +122,8 @@ struct Settings {
     refresh_interval_seconds: u64,
     codex_threshold: u8,
     claude_threshold: u8,
+    codex_enabled: bool,
+    claude_enabled: bool,
 }
 
 impl Default for Settings {
@@ -129,6 +133,8 @@ impl Default for Settings {
             refresh_interval_seconds: 60,
             codex_threshold: 0,
             claude_threshold: 0,
+            codex_enabled: true,
+            claude_enabled: true,
         }
     }
 }
@@ -136,7 +142,7 @@ impl Default for Settings {
 fn main() {
     let show_settings_on_launch = env::args().any(|argument| argument == "--settings");
     if env::args().any(|argument| argument == "--probe") {
-        let result = fetch_all_usage();
+        let result = fetch_all_usage(true, true);
         match result {
             Ok((snapshot, warning)) => {
                 println!(
@@ -177,6 +183,8 @@ fn main() {
                 refresh_interval_seconds: settings.refresh_interval_seconds,
                 codex_threshold: settings.codex_threshold,
                 claude_threshold: settings.claude_threshold,
+                codex_enabled: settings.codex_enabled,
+                claude_enabled: settings.claude_enabled,
                 ..MonitorState::default()
             }));
             app.manage(state.clone());
@@ -210,23 +218,34 @@ fn main() {
 
 fn refresh(app: AppHandle) {
     let state = app.state::<SharedState>().inner().clone();
-    {
+    let (codex_enabled, claude_enabled) = {
         let mut current = state.lock().expect("monitor state lock poisoned");
         if current.refreshing {
             return;
         }
         current.refreshing = true;
         current.last_error = None;
-    }
+        (current.codex_enabled, current.claude_enabled)
+    };
     update_tray(&app, &state);
 
     tauri::async_runtime::spawn_blocking(move || {
-        let result = fetch_all_usage();
+        let result = fetch_all_usage(codex_enabled, claude_enabled);
         let notifications = {
             let mut current = state.lock().expect("monitor state lock poisoned");
             current.refreshing = false;
             match result {
-                Ok((snapshot, warning)) => {
+                Ok((mut snapshot, warning)) => {
+                    // 今回取得できなかったサービスは前回値を引き継ぎ、メニューバーの%を維持する。
+                    // ただし無効化されたサービスは前回値を引き継がない（表示から消す）。
+                    if let Some(previous) = current.latest.as_ref() {
+                        if claude_enabled && snapshot.claude_usage.is_none() {
+                            snapshot.claude_usage = previous.claude_usage.clone();
+                        }
+                        if codex_enabled && snapshot.rate_limits.primary.is_none() {
+                            snapshot.rate_limits = previous.rate_limits.clone();
+                        }
+                    }
                     save_cache(&snapshot);
                     current.latest = Some(snapshot);
                     current.last_error = warning;
@@ -320,7 +339,7 @@ fn start_periodic_refresh(app: AppHandle) {
                 .lock()
                 .expect("monitor state lock poisoned")
                 .refresh_interval_seconds
-                .clamp(5, 300);
+                .clamp(60, 3600);
             if elapsed_seconds >= interval_seconds {
                 elapsed_seconds = 0;
                 refresh(app.clone());
@@ -428,29 +447,36 @@ fn locate_codex() -> Result<PathBuf, String> {
         .ok_or_else(|| "Codex CLIが見つかりません".into())
 }
 
-fn fetch_all_usage() -> Result<(UsageSnapshot, Option<String>), String> {
-    let codex = locate_codex().and_then(|path| fetch_usage(&path));
-    let claude = locate_claude().and_then(|path| fetch_claude_usage_with_retry(&path));
+fn fetch_all_usage(codex_enabled: bool, claude_enabled: bool) -> Result<(UsageSnapshot, Option<String>), String> {
     let mut errors = Vec::new();
-
-    let mut snapshot = match codex {
-        Ok(snapshot) => snapshot,
-        Err(error) => {
-            errors.push(error);
-            UsageSnapshot {
-                rate_limits: RateLimits::default(),
-                claude_usage: None,
-                fetched_at: now_epoch(),
-            }
-        }
+    let mut snapshot = UsageSnapshot {
+        rate_limits: RateLimits::default(),
+        claude_usage: None,
+        fetched_at: now_epoch(),
     };
 
-    match claude {
-        Ok(usage) => snapshot.claude_usage = Some(usage),
-        Err(error) => errors.push(error),
+    if codex_enabled {
+        match locate_codex().and_then(|path| fetch_usage(&path)) {
+            Ok(codex) => {
+                snapshot.rate_limits = codex.rate_limits;
+                snapshot.fetched_at = codex.fetched_at;
+            }
+            Err(error) => errors.push(error),
+        }
     }
 
-    if snapshot.rate_limits.primary.is_none() && snapshot.claude_usage.is_none() {
+    if claude_enabled {
+        match locate_claude().and_then(|path| fetch_claude_usage(&path)) {
+            Ok(usage) => snapshot.claude_usage = Some(usage),
+            Err(error) => errors.push(error),
+        }
+    }
+
+    // 有効なサービスがすべて取得失敗したときだけエラーにする（無効なら静かに空で返す）。
+    if !errors.is_empty()
+        && snapshot.rate_limits.primary.is_none()
+        && snapshot.claude_usage.is_none()
+    {
         return Err(errors.join(" / "));
     }
     let warning = (!errors.is_empty()).then(|| errors.join(" / "));
@@ -481,23 +507,6 @@ fn locate_claude() -> Result<PathBuf, String> {
         .into_iter()
         .find(|candidate| candidate.is_file())
         .ok_or_else(|| "Claude Code CLIが見つかりません".into())
-}
-
-fn fetch_claude_usage_with_retry(claude: &Path) -> Result<ClaudeUsage, String> {
-    const ATTEMPTS: usize = 3;
-    let mut last_error = String::new();
-    for attempt in 0..ATTEMPTS {
-        match fetch_claude_usage(claude) {
-            Ok(usage) => return Ok(usage),
-            Err(error) => {
-                last_error = error;
-                if attempt + 1 < ATTEMPTS {
-                    std::thread::sleep(Duration::from_secs(1));
-                }
-            }
-        }
-    }
-    Err(last_error)
 }
 
 fn fetch_claude_usage(claude: &Path) -> Result<ClaudeUsage, String> {
@@ -564,22 +573,9 @@ fn fetch_claude_usage(claude: &Path) -> Result<ClaudeUsage, String> {
         .write_all(b"/usage\r")
         .and_then(|_| stdin.flush())
         .map_err(|error| format!("Claude Codeへ/usageを送信できません: {error}"))?;
-    // 使用量画面の描画は /usage 実行後にサーバーへ問い合わせるため遅れることがある。
-    // 固定待ちだと遅いネット/マシンで取りこぼすので、必要な見出しが揃うまでポーリングする。
-    let usage_deadline = std::time::Instant::now() + Duration::from_secs(15);
-    loop {
-        let screen = {
-            let captured = captured.lock().expect("Claude output lock poisoned");
-            strip_terminal_sequences(&String::from_utf8_lossy(&captured))
-        };
-        if screen.contains("Current session") && screen.contains("Current week") {
-            break;
-        }
-        if std::time::Instant::now() >= usage_deadline {
-            break;
-        }
-        std::thread::sleep(Duration::from_millis(200));
-    }
+    // ポーリング・リトライはしない（/usage のエンドポイントを叩きすぎるとレート制限が出るため）。
+    // 1回だけ描画を待ち、取得できなければ今回はあきらめる（呼び出し側で前回値を保持する）。
+    std::thread::sleep(Duration::from_secs(5));
     let _ = stdin.write_all(b"\x1b");
     let _ = stdin.flush();
     std::thread::sleep(Duration::from_millis(200));
@@ -778,7 +774,9 @@ fn build_menu(app: &AppHandle, state: &SharedState) -> tauri::Result<Menu<tauri:
     let mut items: Vec<Box<dyn tauri::menu::IsMenuItem<tauri::Wry>>> = Vec::new();
 
     items.push(Box::new(disabled_item(app, "Codex CLI")?));
-    if state.refreshing {
+    if !state.codex_enabled {
+        items.push(Box::new(disabled_item(app, "オフ")?));
+    } else if state.refreshing {
         items.push(Box::new(disabled_item(app, "更新中...")?));
     } else if let Some(snapshot) = &state.latest {
         if let Some(primary) = &snapshot.rate_limits.primary {
@@ -800,7 +798,9 @@ fn build_menu(app: &AppHandle, state: &SharedState) -> tauri::Result<Menu<tauri:
 
     items.push(Box::new(PredefinedMenuItem::separator(app)?));
     items.push(Box::new(disabled_item(app, "Claude Code")?));
-    if state.refreshing {
+    if !state.claude_enabled {
+        items.push(Box::new(disabled_item(app, "オフ")?));
+    } else if state.refreshing {
         items.push(Box::new(disabled_item(app, "更新中...")?));
     } else if let Some(usage) = state
         .latest
@@ -907,7 +907,7 @@ fn show_settings_window(app: &AppHandle) {
     }
     let _ = WebviewWindowBuilder::new(app, "settings", WebviewUrl::App("index.html".into()))
         .title("UsageBar設定")
-        .inner_size(470.0, 540.0)
+        .inner_size(470.0, 600.0)
         .resizable(false)
         .center()
         .build();
@@ -921,6 +921,8 @@ fn get_settings(state: tauri::State<'_, SharedState>) -> Settings {
         refresh_interval_seconds: current.refresh_interval_seconds,
         codex_threshold: current.codex_threshold,
         claude_threshold: current.claude_threshold,
+        codex_enabled: current.codex_enabled,
+        claude_enabled: current.claude_enabled,
     }
 }
 
@@ -930,8 +932,8 @@ fn set_settings(
     state: tauri::State<'_, SharedState>,
     settings: Settings,
 ) -> Result<(), String> {
-    if !(5..=300).contains(&settings.refresh_interval_seconds) {
-        return Err("更新間隔は5〜300秒で指定してください".into());
+    if !(60..=3600).contains(&settings.refresh_interval_seconds) {
+        return Err("更新間隔は60秒以上で指定してください".into());
     }
     if settings.codex_threshold > 100 || settings.claude_threshold > 100 {
         return Err("しきい値は0〜100%で指定してください".into());
@@ -948,9 +950,22 @@ fn set_settings(
             current.claude_threshold = settings.claude_threshold;
             current.claude_notified = false;
         }
+        current.codex_enabled = settings.codex_enabled;
+        current.claude_enabled = settings.claude_enabled;
+        // 無効化されたサービスの表示値は即座にクリアする。
+        if let Some(snapshot) = current.latest.as_mut() {
+            if !settings.codex_enabled {
+                snapshot.rate_limits = RateLimits::default();
+            }
+            if !settings.claude_enabled {
+                snapshot.claude_usage = None;
+            }
+        }
     }
     persist_settings(&settings);
     update_tray(&app, state.inner());
+    // 有効に戻したサービスをすぐ取得しにいく。
+    refresh(app.clone());
     Ok(())
 }
 
