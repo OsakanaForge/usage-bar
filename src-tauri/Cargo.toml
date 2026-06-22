@@ -1,6 +1,6 @@
 [package]
 name = "usage-bar"
-version = "0.1.2"
+version = "0.1.3"
 description = "Codex CLI and Claude Code usage in the macOS menu bar"
 edition = "2024"
 

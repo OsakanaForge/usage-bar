@@ -128,6 +128,13 @@ struct Settings {
     launch_at_login: bool,
 }
 
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct UpdateCheckResult {
+    current_version: String,
+    update_version: Option<String>,
+}
+
 impl Default for Settings {
     fn default() -> Self {
         Self {
@@ -171,7 +178,12 @@ fn main() {
             None,
         ))
         .plugin(tauri_plugin_updater::Builder::new().build())
-        .invoke_handler(tauri::generate_handler![get_settings, set_settings])
+        .invoke_handler(tauri::generate_handler![
+            get_settings,
+            set_settings,
+            get_app_version,
+            check_for_update_now
+        ])
         .on_window_event(|window, event| {
             if window.label() == "settings"
                 && let tauri::WindowEvent::CloseRequested { api, .. } = event
@@ -229,26 +241,31 @@ fn main() {
 
 fn check_for_update(app: AppHandle) {
     tauri::async_runtime::spawn(async move {
-        let result = async {
-            let Some(update) = app.updater()?.check().await? else {
-                return Ok::<(), tauri_plugin_updater::Error>(());
-            };
-
-            let version = update.version.clone();
-            update.download_and_install(|_, _| {}, || {}).await?;
-            send_notification(
-                &app,
-                "UsageBarを更新しました",
-                &format!("バージョン {version} を適用して再起動します。"),
-            );
-            app.restart();
-        }
-        .await;
-
-        if let Err(error) = result {
-            eprintln!("update check failed: {error}");
+        match download_available_update(&app).await {
+            Ok(Some(version)) => {
+                send_notification(
+                    &app,
+                    "UsageBarを更新しました",
+                    &format!("バージョン {version} を適用して再起動します。"),
+                );
+                app.restart();
+            }
+            Ok(None) => {}
+            Err(error) => eprintln!("update check failed: {error}"),
         }
     });
+}
+
+async fn download_available_update(
+    app: &AppHandle,
+) -> Result<Option<String>, tauri_plugin_updater::Error> {
+    let Some(update) = app.updater()?.check().await? else {
+        return Ok(None);
+    };
+
+    let version = update.version.clone();
+    update.download_and_install(|_, _| {}, || {}).await?;
+    Ok(Some(version))
 }
 
 fn refresh(app: AppHandle) {
@@ -961,10 +978,37 @@ fn show_settings_window(app: &AppHandle) {
     }
     let _ = WebviewWindowBuilder::new(app, "settings", WebviewUrl::App("index.html".into()))
         .title("UsageBar設定")
-        .inner_size(470.0, 600.0)
+        .inner_size(470.0, 660.0)
         .resizable(false)
         .center()
         .build();
+}
+
+#[tauri::command]
+fn get_app_version(app: AppHandle) -> String {
+    app.package_info().version.to_string()
+}
+
+#[tauri::command]
+async fn check_for_update_now(app: AppHandle) -> Result<UpdateCheckResult, String> {
+    let current_version = app.package_info().version.to_string();
+    let update_version = download_available_update(&app)
+        .await
+        .map_err(|error| error.to_string())?;
+
+    if let Some(version) = update_version.as_ref() {
+        send_notification(
+            &app,
+            "UsageBarを更新しました",
+            &format!("バージョン {version} を適用して再起動します。"),
+        );
+        app.restart();
+    }
+
+    Ok(UpdateCheckResult {
+        current_version,
+        update_version,
+    })
 }
 
 #[tauri::command]
