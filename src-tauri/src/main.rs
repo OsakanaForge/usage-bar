@@ -16,6 +16,7 @@ use tauri::{
     menu::{Menu, MenuItem, PredefinedMenuItem},
     tray::TrayIconBuilder,
 };
+use tauri_plugin_updater::UpdaterExt;
 
 const TRAY_ID: &str = "codex-usage";
 
@@ -169,6 +170,7 @@ fn main() {
             tauri_plugin_autostart::MacosLauncher::LaunchAgent,
             None,
         ))
+        .plugin(tauri_plugin_updater::Builder::new().build())
         .invoke_handler(tauri::generate_handler![get_settings, set_settings])
         .on_window_event(|window, event| {
             if window.label() == "settings"
@@ -215,6 +217,7 @@ fn main() {
 
             refresh(app.handle().clone());
             start_periodic_refresh(app.handle().clone());
+            check_for_update(app.handle().clone());
             if show_settings_on_launch {
                 show_settings_window(app.handle());
             }
@@ -222,6 +225,30 @@ fn main() {
         })
         .run(tauri::generate_context!())
         .expect("failed to run UsageBar");
+}
+
+fn check_for_update(app: AppHandle) {
+    tauri::async_runtime::spawn(async move {
+        let result = async {
+            let Some(update) = app.updater()?.check().await? else {
+                return Ok::<(), tauri_plugin_updater::Error>(());
+            };
+
+            let version = update.version.clone();
+            update.download_and_install(|_, _| {}, || {}).await?;
+            send_notification(
+                &app,
+                "UsageBarを更新しました",
+                &format!("バージョン {version} を適用して再起動します。"),
+            );
+            app.restart();
+        }
+        .await;
+
+        if let Err(error) = result {
+            eprintln!("update check failed: {error}");
+        }
+    });
 }
 
 fn refresh(app: AppHandle) {
@@ -455,7 +482,10 @@ fn locate_codex() -> Result<PathBuf, String> {
         .ok_or_else(|| "Codex CLIが見つかりません".into())
 }
 
-fn fetch_all_usage(codex_enabled: bool, claude_enabled: bool) -> Result<(UsageSnapshot, Option<String>), String> {
+fn fetch_all_usage(
+    codex_enabled: bool,
+    claude_enabled: bool,
+) -> Result<(UsageSnapshot, Option<String>), String> {
     let mut errors = Vec::new();
     let mut snapshot = UsageSnapshot {
         rate_limits: RateLimits::default(),
