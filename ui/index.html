@@ -97,6 +97,22 @@
         gap: 14px;
       }
 
+      .toggles {
+        display: flex;
+        gap: 18px;
+      }
+
+      .toggle {
+        display: flex;
+        align-items: center;
+        gap: 6px;
+      }
+
+      .toggle input {
+        width: 15px;
+        height: 15px;
+      }
+
       .threshold {
         display: flex;
         align-items: center;
@@ -202,14 +218,26 @@
             <button class="segment" type="button" data-mode="circle" aria-pressed="false">サークル</button>
           </div>
         </div>
+        <div class="row">
+          <span class="label">監視サービス</span>
+          <div class="toggles">
+            <label class="toggle">
+              <input id="codexEnabled" type="checkbox" />
+              <span>Codex</span>
+            </label>
+            <label class="toggle">
+              <input id="claudeEnabled" type="checkbox" />
+              <span>Claude</span>
+            </label>
+          </div>
+        </div>
         <label class="row">
           <span class="label">自動更新</span>
           <select id="refreshInterval">
-            <option value="5">5秒ごと</option>
-            <option value="10">10秒ごと</option>
-            <option value="30">30秒ごと</option>
             <option value="60">60秒ごと</option>
+            <option value="120">2分ごと</option>
             <option value="300">5分ごと</option>
+            <option value="600">10分ごと</option>
           </select>
         </label>
         <div class="row">
@@ -248,6 +276,8 @@
       const interval = document.querySelector("#refreshInterval");
       const codexThreshold = document.querySelector("#codexThreshold");
       const claudeThreshold = document.querySelector("#claudeThreshold");
+      const codexEnabled = document.querySelector("#codexEnabled");
+      const claudeEnabled = document.querySelector("#claudeEnabled");
       const saveButton = document.querySelector("#save");
       const message = document.querySelector("#message");
       let displayMode = "number";
@@ -275,6 +305,8 @@
           interval.value = String(settings.refreshIntervalSeconds);
           codexThreshold.value = String(settings.codexThreshold);
           claudeThreshold.value = String(settings.claudeThreshold);
+          codexEnabled.checked = settings.codexEnabled;
+          claudeEnabled.checked = settings.claudeEnabled;
         } catch (error) {
           message.textContent = String(error);
           message.classList.add("error");
@@ -293,6 +325,8 @@
               refreshIntervalSeconds: Number(interval.value),
               codexThreshold: clampThreshold(codexThreshold.value),
               claudeThreshold: clampThreshold(claudeThreshold.value),
+              codexEnabled: codexEnabled.checked,
+              claudeEnabled: claudeEnabled.checked,
             },
           });
           message.textContent = "適用しました";
