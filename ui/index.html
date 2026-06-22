@@ -219,6 +219,15 @@
           </div>
         </div>
         <div class="row">
+          <span class="label">ログイン時に起動</span>
+          <div class="toggles">
+            <label class="toggle">
+              <input id="launchAtLogin" type="checkbox" />
+              <span>Macのログイン時に自動で起動</span>
+            </label>
+          </div>
+        </div>
+        <div class="row">
           <span class="label">監視サービス</span>
           <div class="toggles">
             <label class="toggle">
@@ -278,6 +287,7 @@
       const claudeThreshold = document.querySelector("#claudeThreshold");
       const codexEnabled = document.querySelector("#codexEnabled");
       const claudeEnabled = document.querySelector("#claudeEnabled");
+      const launchAtLogin = document.querySelector("#launchAtLogin");
       const saveButton = document.querySelector("#save");
       const message = document.querySelector("#message");
       let displayMode = "number";
@@ -307,6 +317,7 @@
           claudeThreshold.value = String(settings.claudeThreshold);
           codexEnabled.checked = settings.codexEnabled;
           claudeEnabled.checked = settings.claudeEnabled;
+          launchAtLogin.checked = settings.launchAtLogin;
         } catch (error) {
           message.textContent = String(error);
           message.classList.add("error");
@@ -327,6 +338,7 @@
               claudeThreshold: clampThreshold(claudeThreshold.value),
               codexEnabled: codexEnabled.checked,
               claudeEnabled: claudeEnabled.checked,
+              launchAtLogin: launchAtLogin.checked,
             },
           });
           message.textContent = "適用しました";

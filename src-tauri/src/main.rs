@@ -124,6 +124,7 @@ struct Settings {
     claude_threshold: u8,
     codex_enabled: bool,
     claude_enabled: bool,
+    launch_at_login: bool,
 }
 
 impl Default for Settings {
@@ -135,6 +136,7 @@ impl Default for Settings {
             claude_threshold: 0,
             codex_enabled: true,
             claude_enabled: true,
+            launch_at_login: true,
         }
     }
 }
@@ -163,6 +165,10 @@ fn main() {
 
     tauri::Builder::default()
         .plugin(tauri_plugin_notification::init())
+        .plugin(tauri_plugin_autostart::init(
+            tauri_plugin_autostart::MacosLauncher::LaunchAgent,
+            None,
+        ))
         .invoke_handler(tauri::generate_handler![get_settings, set_settings])
         .on_window_event(|window, event| {
             if window.label() == "settings"
@@ -177,6 +183,8 @@ fn main() {
             app.set_activation_policy(tauri::ActivationPolicy::Accessory);
 
             let settings = load_settings();
+            // ログイン時起動の実状態を設定値に合わせる（初回はデフォルトONで有効化される）。
+            apply_launch_at_login(app.handle(), settings.launch_at_login);
             let state = Arc::new(Mutex::new(MonitorState {
                 latest: load_cache(),
                 display_mode: settings.display_mode,
@@ -899,6 +907,22 @@ fn disabled_item(app: &AppHandle, label: &str) -> tauri::Result<MenuItem<tauri::
     MenuItem::new(app, label, false, None::<&str>)
 }
 
+fn apply_launch_at_login(app: &AppHandle, enabled: bool) {
+    use tauri_plugin_autostart::ManagerExt;
+    let manager = app.autolaunch();
+    let currently = manager.is_enabled().unwrap_or(false);
+    if enabled && !currently {
+        let _ = manager.enable();
+    } else if !enabled && currently {
+        let _ = manager.disable();
+    }
+}
+
+fn launch_at_login_enabled(app: &AppHandle) -> bool {
+    use tauri_plugin_autostart::ManagerExt;
+    app.autolaunch().is_enabled().unwrap_or(false)
+}
+
 fn show_settings_window(app: &AppHandle) {
     if let Some(window) = app.get_webview_window("settings") {
         let _ = window.show();
@@ -914,7 +938,7 @@ fn show_settings_window(app: &AppHandle) {
 }
 
 #[tauri::command]
-fn get_settings(state: tauri::State<'_, SharedState>) -> Settings {
+fn get_settings(app: AppHandle, state: tauri::State<'_, SharedState>) -> Settings {
     let current = state.lock().expect("monitor state lock poisoned");
     Settings {
         display_mode: current.display_mode,
@@ -923,6 +947,7 @@ fn get_settings(state: tauri::State<'_, SharedState>) -> Settings {
         claude_threshold: current.claude_threshold,
         codex_enabled: current.codex_enabled,
         claude_enabled: current.claude_enabled,
+        launch_at_login: launch_at_login_enabled(&app),
     }
 }
 
@@ -952,6 +977,7 @@ fn set_settings(
         }
         current.codex_enabled = settings.codex_enabled;
         current.claude_enabled = settings.claude_enabled;
+        apply_launch_at_login(&app, settings.launch_at_login);
         // 無効化されたサービスの表示値は即座にクリアする。
         if let Some(snapshot) = current.latest.as_mut() {
             if !settings.codex_enabled {
