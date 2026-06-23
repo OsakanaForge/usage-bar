@@ -171,6 +171,13 @@ fn main() {
         }
     }
 
+    // Claude Code の statusLine から渡されるJSONを受け取り、rate_limits をキャッシュへ保存する。
+    // （Claude Code が呼び出す: usage-bar --statusline ）
+    if env::args().any(|argument| argument == "--statusline") {
+        run_statusline_capture();
+        return;
+    }
+
     tauri::Builder::default()
         .plugin(tauri_plugin_notification::init())
         .plugin(tauri_plugin_autostart::init(
@@ -521,7 +528,8 @@ fn fetch_all_usage(
     }
 
     if claude_enabled {
-        match locate_claude().and_then(|path| fetch_claude_usage(&path)) {
+        // StatusLine が書き出したローカルJSONから取得する（/usage エンドポイントは叩かない）。
+        match read_claude_statusline() {
             Ok(usage) => snapshot.claude_usage = Some(usage),
             Err(error) => errors.push(error),
         }
@@ -538,6 +546,7 @@ fn fetch_all_usage(
     Ok((snapshot, warning))
 }
 
+#[allow(dead_code)]
 fn locate_claude() -> Result<PathBuf, String> {
     let mut candidates = vec![
         PathBuf::from("/opt/homebrew/bin/claude"),
@@ -564,6 +573,8 @@ fn locate_claude() -> Result<PathBuf, String> {
         .ok_or_else(|| "Claude Code CLIが見つかりません".into())
 }
 
+// StatusLine 方式へ移行したため自動取得では未使用。将来「今すぐ更新」時の手動フォールバック用に残す。
+#[allow(dead_code)]
 fn fetch_claude_usage(claude: &Path) -> Result<ClaudeUsage, String> {
     let probe_directory = cache_path()
         .and_then(|path| {
@@ -1127,6 +1138,85 @@ fn format_reset_time(timestamp: u64) -> String {
 fn cache_path() -> Option<PathBuf> {
     env::var_os("HOME")
         .map(|home| PathBuf::from(home).join("Library/Application Support/UsageBar/status.json"))
+}
+
+fn claude_status_path() -> Option<PathBuf> {
+    env::var_os("HOME").map(|home| {
+        PathBuf::from(home).join("Library/Application Support/UsageBar/claude-status.json")
+    })
+}
+
+/// `usage-bar --statusline` 実行時の処理。Claude Code の statusLine から渡される
+/// JSON を stdin で受け取り、そのまま保存して、ステータス行を stdout に出力する。
+fn run_statusline_capture() {
+    let mut input = String::new();
+    if std::io::stdin().read_to_string(&mut input).is_err() {
+        return;
+    }
+    if let Some(path) = claude_status_path() {
+        if let Some(directory) = path.parent() {
+            let _ = std::fs::create_dir_all(directory);
+        }
+        let _ = std::fs::write(&path, input.as_bytes());
+    }
+    // Claude Code 上のステータス行表示（任意）。残量を簡潔に出す。
+    let remaining = |value: &Value, key: &str| -> Option<u8> {
+        let used = value
+            .get("rate_limits")?
+            .get(key)?
+            .get("used_percentage")?
+            .as_f64()?;
+        Some((100.0 - used).round().clamp(0.0, 100.0) as u8)
+    };
+    if let Ok(value) = serde_json::from_str::<Value>(&input)
+        && let (Some(five), Some(seven)) =
+            (remaining(&value, "five_hour"), remaining(&value, "seven_day"))
+    {
+        println!("Claude 5h {five}% · 7d {seven}%");
+    } else {
+        println!("UsageBar");
+    }
+}
+
+/// StatusLine が保存した JSON から Claude 使用量を読み取る（/usage は叩かない）。
+fn read_claude_statusline() -> Result<ClaudeUsage, String> {
+    let path = claude_status_path().ok_or("StatusLine保存先を決定できません")?;
+    let data = std::fs::read(&path).map_err(|_| {
+        "StatusLineデータがまだありません（Claude Codeでセッションを開くと取得されます）".to_string()
+    })?;
+    let value: Value = serde_json::from_slice(&data)
+        .map_err(|error| format!("StatusLineデータを解析できません: {error}"))?;
+    let rate_limits = value
+        .get("rate_limits")
+        .ok_or("StatusLineにrate_limitsがありません（対象プラン/初回応答後に付与されます）")?;
+
+    let window = |key: &str| -> Result<ClaudeWindow, String> {
+        let window = rate_limits
+            .get(key)
+            .ok_or_else(|| format!("StatusLineに{key}がありません"))?;
+        let used = window
+            .get("used_percentage")
+            .and_then(Value::as_f64)
+            .ok_or_else(|| format!("StatusLineの{key}使用率を解析できません"))?;
+        let resets_at = window
+            .get("resets_at")
+            .and_then(Value::as_u64)
+            .unwrap_or(0);
+        Ok(ClaudeWindow {
+            used_percent: used.round().clamp(0.0, 100.0) as u8,
+            resets_label: if resets_at > 0 {
+                format_reset_time(resets_at)
+            } else {
+                "不明".to_string()
+            },
+        })
+    };
+
+    Ok(ClaudeUsage {
+        five_hour: window("five_hour")?,
+        seven_day: window("seven_day")?,
+        plan_type: None,
+    })
 }
 
 fn legacy_cache_path() -> Option<PathBuf> {
