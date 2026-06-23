@@ -153,8 +153,21 @@
 
       .version { color: #6e6e73; }
 
+      .update-actions {
+        display: flex;
+        align-items: center;
+        gap: 8px;
+      }
+
+      .update-frequency {
+        width: auto;
+        min-width: 72px;
+        height: 30px;
+        padding: 0 24px 0 8px;
+      }
+
       .update-button {
-        min-width: 146px;
+        min-width: 104px;
         height: 30px;
         padding: 0 12px;
         border: 1px solid rgba(0, 0, 0, 0.22);
@@ -291,7 +304,14 @@
           <span class="label">バージョン</span>
           <div class="update-info">
             <span class="version" id="appVersion">確認中…</span>
-            <button class="update-button" id="checkUpdate" type="button">アップデートを確認</button>
+            <div class="update-actions">
+              <select id="updateFrequency" class="update-frequency">
+                <option value="daily">毎日</option>
+                <option value="weekly">毎週</option>
+                <option value="monthly">毎月</option>
+              </select>
+              <button class="update-button" id="checkUpdate" type="button">今すぐ確認</button>
+            </div>
           </div>
         </div>
       </section>
@@ -321,6 +341,7 @@
       const saveButton = document.querySelector("#save");
       const appVersion = document.querySelector("#appVersion");
       const checkUpdateButton = document.querySelector("#checkUpdate");
+      const updateFrequency = document.querySelector("#updateFrequency");
       const message = document.querySelector("#message");
       let displayMode = "number";
 
@@ -350,6 +371,7 @@
           codexEnabled.checked = settings.codexEnabled;
           claudeEnabled.checked = settings.claudeEnabled;
           launchAtLogin.checked = settings.launchAtLogin;
+          updateFrequency.value = settings.updateFrequency;
         } catch (error) {
           message.textContent = String(error);
           message.classList.add("error");
@@ -386,7 +408,7 @@
           message.classList.add("error");
         } finally {
           checkUpdateButton.disabled = false;
-          checkUpdateButton.textContent = "アップデートを確認";
+          checkUpdateButton.textContent = "今すぐ確認";
         }
       });
 
@@ -405,6 +427,7 @@
               codexEnabled: codexEnabled.checked,
               claudeEnabled: claudeEnabled.checked,
               launchAtLogin: launchAtLogin.checked,
+              updateFrequency: updateFrequency.value,
             },
           });
           message.textContent = "適用しました";
