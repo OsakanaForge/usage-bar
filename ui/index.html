@@ -263,15 +263,6 @@
             </label>
           </div>
         </div>
-        <div class="row">
-          <span class="label">Claude使用量</span>
-          <div class="toggles">
-            <label class="toggle">
-              <input id="claudeStatusline" type="checkbox" />
-              <span>StatusLineから取得（推奨）</span>
-            </label>
-          </div>
-        </div>
         <label class="row">
           <span class="label">自動更新</span>
           <select id="refreshInterval">
@@ -327,7 +318,6 @@
       const codexEnabled = document.querySelector("#codexEnabled");
       const claudeEnabled = document.querySelector("#claudeEnabled");
       const launchAtLogin = document.querySelector("#launchAtLogin");
-      const claudeStatusline = document.querySelector("#claudeStatusline");
       const saveButton = document.querySelector("#save");
       const appVersion = document.querySelector("#appVersion");
       const checkUpdateButton = document.querySelector("#checkUpdate");
@@ -360,7 +350,6 @@
           codexEnabled.checked = settings.codexEnabled;
           claudeEnabled.checked = settings.claudeEnabled;
           launchAtLogin.checked = settings.launchAtLogin;
-          claudeStatusline.checked = settings.claudeStatusline;
         } catch (error) {
           message.textContent = String(error);
           message.classList.add("error");
@@ -416,7 +405,6 @@
               codexEnabled: codexEnabled.checked,
               claudeEnabled: claudeEnabled.checked,
               launchAtLogin: launchAtLogin.checked,
-              claudeStatusline: claudeStatusline.checked,
             },
           });
           message.textContent = "適用しました";

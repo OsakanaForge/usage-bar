@@ -126,7 +126,6 @@ struct Settings {
     codex_enabled: bool,
     claude_enabled: bool,
     launch_at_login: bool,
-    claude_statusline: bool,
 }
 
 #[derive(Serialize)]
@@ -146,7 +145,6 @@ impl Default for Settings {
             codex_enabled: true,
             claude_enabled: true,
             launch_at_login: true,
-            claude_statusline: false,
         }
     }
 }
@@ -208,6 +206,8 @@ fn main() {
             let settings = load_settings();
             // ログイン時起動の実状態を設定値に合わせる（初回はデフォルトONで有効化される）。
             apply_launch_at_login(app.handle(), settings.launch_at_login);
+            // Claude監視がONなら statusLine を自動登録（デフォルトON・設定画面には出さない）。
+            let _ = set_statusline_registered(settings.claude_enabled);
             let state = Arc::new(Mutex::new(MonitorState {
                 latest: load_cache(),
                 display_mode: settings.display_mode,
@@ -1035,7 +1035,6 @@ fn get_settings(app: AppHandle, state: tauri::State<'_, SharedState>) -> Setting
         codex_enabled: current.codex_enabled,
         claude_enabled: current.claude_enabled,
         launch_at_login: launch_at_login_enabled(&app),
-        claude_statusline: is_statusline_registered(),
     }
 }
 
@@ -1076,8 +1075,8 @@ fn set_settings(
             }
         }
     }
-    // Claude Code の statusLine 登録/解除（~/.claude/settings.json を更新）。
-    set_statusline_registered(settings.claude_statusline)?;
+    // Claude監視のON/OFFに連動して statusLine を登録/解除（~/.claude/settings.json を更新）。
+    let _ = set_statusline_registered(settings.claude_enabled);
     persist_settings(&settings);
     update_tray(&app, state.inner());
     // 有効に戻したサービスをすぐ取得しにいく。
