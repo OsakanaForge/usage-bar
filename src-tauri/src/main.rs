@@ -103,6 +103,7 @@ struct MonitorState {
     claude_notified: bool,
     codex_enabled: bool,
     claude_enabled: bool,
+    update_frequency: UpdateFrequency,
 }
 
 type SharedState = Arc<Mutex<MonitorState>>;
@@ -113,6 +114,25 @@ enum DisplayMode {
     #[default]
     Number,
     Circle,
+}
+
+#[derive(Clone, Copy, Debug, Default, Deserialize, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+enum UpdateFrequency {
+    #[default]
+    Daily,
+    Weekly,
+    Monthly,
+}
+
+impl UpdateFrequency {
+    fn seconds(self) -> u64 {
+        match self {
+            UpdateFrequency::Daily => 24 * 60 * 60,
+            UpdateFrequency::Weekly => 7 * 24 * 60 * 60,
+            UpdateFrequency::Monthly => 30 * 24 * 60 * 60,
+        }
+    }
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -126,6 +146,7 @@ struct Settings {
     codex_enabled: bool,
     claude_enabled: bool,
     launch_at_login: bool,
+    update_frequency: UpdateFrequency,
 }
 
 #[derive(Serialize)]
@@ -145,6 +166,7 @@ impl Default for Settings {
             codex_enabled: true,
             claude_enabled: true,
             launch_at_login: true,
+            update_frequency: UpdateFrequency::Daily,
         }
     }
 }
@@ -216,6 +238,7 @@ fn main() {
                 claude_threshold: settings.claude_threshold,
                 codex_enabled: settings.codex_enabled,
                 claude_enabled: settings.claude_enabled,
+                update_frequency: settings.update_frequency,
                 ..MonitorState::default()
             }));
             app.manage(state.clone());
@@ -238,7 +261,13 @@ fn main() {
 
             refresh(app.handle().clone());
             start_periodic_refresh(app.handle().clone());
-            check_for_update(app.handle().clone());
+            // 設定の確認頻度に達していれば自動更新チェックを実行。
+            if now_epoch().saturating_sub(read_last_update_check())
+                >= settings.update_frequency.seconds()
+            {
+                write_last_update_check(now_epoch());
+                check_for_update(app.handle().clone());
+            }
             if show_settings_on_launch {
                 show_settings_window(app.handle());
             }
@@ -1035,6 +1064,7 @@ fn get_settings(app: AppHandle, state: tauri::State<'_, SharedState>) -> Setting
         codex_enabled: current.codex_enabled,
         claude_enabled: current.claude_enabled,
         launch_at_login: launch_at_login_enabled(&app),
+        update_frequency: current.update_frequency,
     }
 }
 
@@ -1064,6 +1094,7 @@ fn set_settings(
         }
         current.codex_enabled = settings.codex_enabled;
         current.claude_enabled = settings.claude_enabled;
+        current.update_frequency = settings.update_frequency;
         apply_launch_at_login(&app, settings.launch_at_login);
         // 無効化されたサービスの表示値は即座にクリアする。
         if let Some(snapshot) = current.latest.as_mut() {
@@ -1152,6 +1183,29 @@ fn claude_status_path() -> Option<PathBuf> {
 
 fn claude_settings_path() -> Option<PathBuf> {
     env::var_os("HOME").map(|home| PathBuf::from(home).join(".claude/settings.json"))
+}
+
+fn last_update_check_path() -> Option<PathBuf> {
+    env::var_os("HOME").map(|home| {
+        PathBuf::from(home).join("Library/Application Support/UsageBar/last-update-check")
+    })
+}
+
+fn read_last_update_check() -> u64 {
+    last_update_check_path()
+        .and_then(|path| std::fs::read_to_string(path).ok())
+        .and_then(|text| text.trim().parse::<u64>().ok())
+        .unwrap_or(0)
+}
+
+fn write_last_update_check(timestamp: u64) {
+    let Some(path) = last_update_check_path() else {
+        return;
+    };
+    if let Some(directory) = path.parent() {
+        let _ = std::fs::create_dir_all(directory);
+    }
+    let _ = std::fs::write(path, timestamp.to_string());
 }
 
 /// このアプリ自身を呼ぶ statusLine コマンド文字列（インストール先に追従）。
