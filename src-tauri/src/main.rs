@@ -47,6 +47,8 @@ struct RateLimits {
 struct ClaudeWindow {
     used_percent: u8,
     resets_label: String,
+    #[serde(default)]
+    resets_at: u64,
 }
 
 impl ClaudeWindow {
@@ -104,6 +106,10 @@ struct MonitorState {
     codex_enabled: bool,
     claude_enabled: bool,
     update_frequency: UpdateFrequency,
+    five_hour_reset_at: u64,
+    five_hour_reset_notified: bool,
+    seven_day_reset_at: u64,
+    seven_day_reset_notified: bool,
 }
 
 type SharedState = Arc<Mutex<MonitorState>>;
@@ -174,7 +180,7 @@ impl Default for Settings {
 fn main() {
     let show_settings_on_launch = env::args().any(|argument| argument == "--settings");
     if env::args().any(|argument| argument == "--probe") {
-        let result = fetch_all_usage(true, true);
+        let result = fetch_all_usage(true, true, true);
         match result {
             Ok((snapshot, warning)) => {
                 println!(
@@ -252,14 +258,14 @@ fn main() {
                 .title("Codex ...")
                 .menu(&initial_menu)
                 .on_menu_event(|app, event| match event.id.as_ref() {
-                    "refresh" => refresh(app.clone()),
+                    "refresh" => refresh(app.clone(), true),
                     "settings" => show_settings_window(app),
                     "quit" => app.exit(0),
                     _ => {}
                 })
                 .build(app)?;
 
-            refresh(app.handle().clone());
+            refresh(app.handle().clone(), false);
             start_periodic_refresh(app.handle().clone());
             // 設定の確認頻度に達していれば自動更新チェックを実行。
             if now_epoch().saturating_sub(read_last_update_check())
@@ -306,7 +312,7 @@ async fn download_available_update(
     Ok(Some(version))
 }
 
-fn refresh(app: AppHandle) {
+fn refresh(app: AppHandle, manual: bool) {
     let state = app.state::<SharedState>().inner().clone();
     let (codex_enabled, claude_enabled) = {
         let mut current = state.lock().expect("monitor state lock poisoned");
@@ -320,7 +326,7 @@ fn refresh(app: AppHandle) {
     update_tray(&app, &state);
 
     tauri::async_runtime::spawn_blocking(move || {
-        let result = fetch_all_usage(codex_enabled, claude_enabled);
+        let result = fetch_all_usage(codex_enabled, claude_enabled, manual);
         let notifications = {
             let mut current = state.lock().expect("monitor state lock poisoned");
             current.refreshing = false;
@@ -339,7 +345,9 @@ fn refresh(app: AppHandle) {
                     save_cache(&snapshot);
                     current.latest = Some(snapshot);
                     current.last_error = warning;
-                    pending_notifications(&mut current)
+                    let mut notifications = pending_notifications(&mut current);
+                    notifications.extend(reset_notifications(&mut current));
+                    notifications
                 }
                 Err(error) => {
                     current.last_error = Some(error);
@@ -352,6 +360,64 @@ fn refresh(app: AppHandle) {
         }
         update_tray(&app, &state);
     });
+}
+
+/// Claude のトークン枠（5時間/週間）がリセットされたら通知を返す。
+/// resets_at(epoch) を追跡し、その時刻を過ぎたら一度だけ通知する。
+fn reset_notifications(state: &mut MonitorState) -> Vec<(String, String)> {
+    let mut out = Vec::new();
+    let Some(usage) = state
+        .latest
+        .as_ref()
+        .and_then(|snapshot| snapshot.claude_usage.as_ref())
+    else {
+        return out;
+    };
+    let five = usage.five_hour.resets_at;
+    let seven = usage.seven_day.resets_at;
+    let now = now_epoch();
+    check_reset(
+        "Claudeの5時間枠",
+        five,
+        now,
+        &mut state.five_hour_reset_at,
+        &mut state.five_hour_reset_notified,
+        &mut out,
+    );
+    check_reset(
+        "Claudeの週間枠",
+        seven,
+        now,
+        &mut state.seven_day_reset_at,
+        &mut state.seven_day_reset_notified,
+        &mut out,
+    );
+    out
+}
+
+fn check_reset(
+    name: &str,
+    resets_at: u64,
+    now: u64,
+    tracked: &mut u64,
+    notified: &mut bool,
+    out: &mut Vec<(String, String)>,
+) {
+    if resets_at == 0 {
+        return; // epoch不明（usageスクレイプ等）は対象外。
+    }
+    // 新しい枠を観測したら再アーム。既に過ぎている枠なら通知済み扱い（起動時の誤通知防止）。
+    if resets_at > *tracked {
+        *tracked = resets_at;
+        *notified = now >= resets_at;
+    }
+    if *tracked != 0 && now >= *tracked && !*notified {
+        *notified = true;
+        out.push((
+            "UsageBar".to_string(),
+            format!("{name}がリセットされました（利用可能になりました）"),
+        ));
+    }
 }
 
 fn pending_notifications(state: &mut MonitorState) -> Vec<(String, String)> {
@@ -432,7 +498,7 @@ fn start_periodic_refresh(app: AppHandle) {
                 .clamp(60, 3600);
             if elapsed_seconds >= interval_seconds {
                 elapsed_seconds = 0;
-                refresh(app.clone());
+                refresh(app.clone(), false);
             }
         }
     });
@@ -540,6 +606,7 @@ fn locate_codex() -> Result<PathBuf, String> {
 fn fetch_all_usage(
     codex_enabled: bool,
     claude_enabled: bool,
+    manual: bool,
 ) -> Result<(UsageSnapshot, Option<String>), String> {
     let mut errors = Vec::new();
     let mut snapshot = UsageSnapshot {
@@ -559,8 +626,7 @@ fn fetch_all_usage(
     }
 
     if claude_enabled {
-        // StatusLine が書き出したローカルJSONから取得する（/usage エンドポイントは叩かない）。
-        match read_claude_statusline() {
+        match fetch_claude(manual) {
             Ok(usage) => snapshot.claude_usage = Some(usage),
             Err(error) => errors.push(error),
         }
@@ -577,7 +643,6 @@ fn fetch_all_usage(
     Ok((snapshot, warning))
 }
 
-#[allow(dead_code)]
 fn locate_claude() -> Result<PathBuf, String> {
     let mut candidates = vec![
         PathBuf::from("/opt/homebrew/bin/claude"),
@@ -604,8 +669,35 @@ fn locate_claude() -> Result<PathBuf, String> {
         .ok_or_else(|| "Claude Code CLIが見つかりません".into())
 }
 
-// StatusLine 方式へ移行したため自動取得では未使用。将来「今すぐ更新」時の手動フォールバック用に残す。
-#[allow(dead_code)]
+/// Claude 使用量を取得する。基本は StatusLine のローカルJSONを読む。
+/// StatusLine が無い（初回）・古い（鮮度切れ）・手動更新のときだけ usage でバックフィルする。
+/// 自動のバックフィルは throttle で頻度を抑え、/usage を叩きすぎない。
+fn fetch_claude(manual: bool) -> Result<ClaudeUsage, String> {
+    const STALE_SECS: u64 = 30 * 60;
+    const BACKFILL_THROTTLE_SECS: u64 = 30 * 60;
+
+    let statusline = read_claude_statusline();
+    let fresh = statusline.is_ok()
+        && claude_status_age_secs()
+            .map(|age| age < STALE_SECS)
+            .unwrap_or(false);
+    if fresh {
+        return statusline;
+    }
+
+    // 初回 / 鮮度切れ / 手動 のときだけ usage でバックフィル。
+    let throttle_ok =
+        now_epoch().saturating_sub(read_last_backfill()) >= BACKFILL_THROTTLE_SECS;
+    if manual || throttle_ok {
+        write_last_backfill(now_epoch());
+        if let Ok(usage) = locate_claude().and_then(|path| fetch_claude_usage(&path)) {
+            return Ok(usage);
+        }
+    }
+    // バックフィル不可・失敗時は StatusLine（古くても）を使う。両方無ければそのエラーを返す。
+    statusline
+}
+
 fn fetch_claude_usage(claude: &Path) -> Result<ClaudeUsage, String> {
     let probe_directory = cache_path()
         .and_then(|path| {
@@ -770,10 +862,12 @@ fn parse_claude_usage(screen: &str) -> Result<ClaudeUsage, String> {
                 .find(|word| is_clock_time(word))
                 .unwrap_or("不明")
                 .to_string(),
+            resets_at: 0,
         },
         seven_day: ClaudeWindow {
             used_percent: percent_before_used(week)?,
             resets_label: extract_week_reset(week).unwrap_or_else(|| "不明".into()),
+            resets_at: 0,
         },
         plan_type: None,
     })
@@ -1111,7 +1205,7 @@ fn set_settings(
     persist_settings(&settings);
     update_tray(&app, state.inner());
     // 有効に戻したサービスをすぐ取得しにいく。
-    refresh(app.clone());
+    refresh(app.clone(), false);
     Ok(())
 }
 
@@ -1183,6 +1277,37 @@ fn claude_status_path() -> Option<PathBuf> {
 
 fn claude_settings_path() -> Option<PathBuf> {
     env::var_os("HOME").map(|home| PathBuf::from(home).join(".claude/settings.json"))
+}
+
+/// StatusLine キャッシュの最終更新からの経過秒数（無ければ None）。
+fn claude_status_age_secs() -> Option<u64> {
+    let path = claude_status_path()?;
+    let modified = std::fs::metadata(&path).ok()?.modified().ok()?;
+    let modified_epoch = modified.duration_since(UNIX_EPOCH).ok()?.as_secs();
+    Some(now_epoch().saturating_sub(modified_epoch))
+}
+
+fn last_backfill_path() -> Option<PathBuf> {
+    env::var_os("HOME").map(|home| {
+        PathBuf::from(home).join("Library/Application Support/UsageBar/last-claude-backfill")
+    })
+}
+
+fn read_last_backfill() -> u64 {
+    last_backfill_path()
+        .and_then(|path| std::fs::read_to_string(path).ok())
+        .and_then(|text| text.trim().parse::<u64>().ok())
+        .unwrap_or(0)
+}
+
+fn write_last_backfill(timestamp: u64) {
+    let Some(path) = last_backfill_path() else {
+        return;
+    };
+    if let Some(directory) = path.parent() {
+        let _ = std::fs::create_dir_all(directory);
+    }
+    let _ = std::fs::write(path, timestamp.to_string());
 }
 
 fn last_update_check_path() -> Option<PathBuf> {
@@ -1354,6 +1479,7 @@ fn read_claude_statusline() -> Result<ClaudeUsage, String> {
             } else {
                 "不明".to_string()
             },
+            resets_at,
         })
     };
 
