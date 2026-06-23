@@ -206,6 +206,8 @@ fn main() {
             let settings = load_settings();
             // ログイン時起動の実状態を設定値に合わせる（初回はデフォルトONで有効化される）。
             apply_launch_at_login(app.handle(), settings.launch_at_login);
+            // Claude監視がONなら statusLine を自動登録（デフォルトON・設定画面には出さない）。
+            let _ = set_statusline_registered(settings.claude_enabled);
             let state = Arc::new(Mutex::new(MonitorState {
                 latest: load_cache(),
                 display_mode: settings.display_mode,
@@ -1073,6 +1075,8 @@ fn set_settings(
             }
         }
     }
+    // Claude監視のON/OFFに連動して statusLine を登録/解除（~/.claude/settings.json を更新）。
+    let _ = set_statusline_registered(settings.claude_enabled);
     persist_settings(&settings);
     update_tray(&app, state.inner());
     // 有効に戻したサービスをすぐ取得しにいく。
@@ -1144,6 +1148,93 @@ fn claude_status_path() -> Option<PathBuf> {
     env::var_os("HOME").map(|home| {
         PathBuf::from(home).join("Library/Application Support/UsageBar/claude-status.json")
     })
+}
+
+fn claude_settings_path() -> Option<PathBuf> {
+    env::var_os("HOME").map(|home| PathBuf::from(home).join(".claude/settings.json"))
+}
+
+/// このアプリ自身を呼ぶ statusLine コマンド文字列（インストール先に追従）。
+fn statusline_command_string() -> String {
+    let exe = std::env::current_exe()
+        .ok()
+        .and_then(|path| path.to_str().map(str::to_string))
+        .unwrap_or_else(|| "usage-bar".to_string());
+    format!("{exe} --statusline")
+}
+
+/// ~/.claude/settings.json に UsageBar の statusLine が登録済みか。
+fn is_statusline_registered() -> bool {
+    let Some(path) = claude_settings_path() else {
+        return false;
+    };
+    let Ok(data) = std::fs::read(&path) else {
+        return false;
+    };
+    let Ok(value) = serde_json::from_slice::<Value>(&data) else {
+        return false;
+    };
+    value
+        .get("statusLine")
+        .and_then(|line| line.get("command"))
+        .and_then(Value::as_str)
+        .map(|command| command.contains("--statusline"))
+        .unwrap_or(false)
+}
+
+/// ~/.claude/settings.json の statusLine を登録/解除する。既存のキーは保持する。
+fn set_statusline_registered(enabled: bool) -> Result<(), String> {
+    if enabled == is_statusline_registered() {
+        return Ok(());
+    }
+    let path = claude_settings_path().ok_or("~/.claude/settings.json のパスを決定できません")?;
+    let mut value: Value = if path.exists() {
+        let data =
+            std::fs::read(&path).map_err(|error| format!("settings.json を読めません: {error}"))?;
+        serde_json::from_slice(&data)
+            .map_err(|error| format!("settings.json を解析できません: {error}"))?
+    } else {
+        json!({})
+    };
+    let object = value
+        .as_object_mut()
+        .ok_or("settings.json の形式が不正です")?;
+
+    // 変更前にバックアップを残す。
+    if path.exists() {
+        let _ = std::fs::copy(&path, path.with_extension("json.usagebar-bak"));
+    }
+
+    if enabled {
+        object.insert(
+            "statusLine".to_string(),
+            json!({
+                "type": "command",
+                "command": statusline_command_string(),
+            }),
+        );
+    } else {
+        // UsageBar が登録した statusLine のときだけ削除する。
+        let ours = object
+            .get("statusLine")
+            .and_then(|line| line.get("command"))
+            .and_then(Value::as_str)
+            .map(|command| command.contains("--statusline"))
+            .unwrap_or(false);
+        if ours {
+            object.remove("statusLine");
+        }
+    }
+
+    if let Some(directory) = path.parent() {
+        std::fs::create_dir_all(directory)
+            .map_err(|error| format!("~/.claude を作成できません: {error}"))?;
+    }
+    let data = serde_json::to_vec_pretty(&value)
+        .map_err(|error| format!("settings.json を生成できません: {error}"))?;
+    std::fs::write(&path, data)
+        .map_err(|error| format!("settings.json を書き込めません: {error}"))?;
+    Ok(())
 }
 
 /// `usage-bar --statusline` 実行時の処理。Claude Code の statusLine から渡される
