@@ -669,33 +669,68 @@ fn locate_claude() -> Result<PathBuf, String> {
         .ok_or_else(|| "Claude Code CLIが見つかりません".into())
 }
 
-/// Claude 使用量を取得する。基本は StatusLine のローカルJSONを読む。
-/// StatusLine が無い（初回）・古い（鮮度切れ）・手動更新のときだけ usage でバックフィルする。
-/// 自動のバックフィルは throttle で頻度を抑え、/usage を叩きすぎない。
+/// Claude 使用量を取得する。データ源は 2 つ:
+///   1. StatusLine（Claude Code がターミナルでステータス行を描画したとき更新）
+///   2. /usage バックフィルキャッシュ（StatusLine が古いときだけ叩いて保存）
+/// どちらも UsageBar 側からは更新タイミングを制御できないため、ファイルの鮮度
+/// （mtime）で新しい方を採用する。両方が鮮度切れ（または初回/手動）のときだけ
+/// /usage を throttle 付きで叩き、結果をバックフィルキャッシュへ保存して、次回以降は
+/// それを fresh として扱う（古い StatusLine 値で上書きされるのを防ぐ）。
 fn fetch_claude(manual: bool) -> Result<ClaudeUsage, String> {
     const STALE_SECS: u64 = 30 * 60;
-    const BACKFILL_THROTTLE_SECS: u64 = 30 * 60;
+    const BACKFILL_THROTTLE_SECS: u64 = 10 * 60;
 
-    let statusline = read_claude_statusline();
-    let fresh = statusline.is_ok()
-        && claude_status_age_secs()
-            .map(|age| age < STALE_SECS)
-            .unwrap_or(false);
-    if fresh {
-        return statusline;
+    // StatusLine と バックフィルキャッシュ のうち、鮮度の新しい方を best とする。
+    let statusline = read_claude_statusline()
+        .ok()
+        .map(|usage| (usage, claude_status_age_secs().unwrap_or(u64::MAX)));
+    let best = fresher(statusline, read_claude_backfill_cache());
+
+    // ファイルが新しくても、ウィンドウのリセット時刻が既に過去なら使用率は無意味
+    // （リセット済みなのに古い値を表示し続ける症状の原因）。その場合は鮮度切れ扱い。
+    if let Some((usage, age)) = &best
+        && *age < STALE_SECS
+        && !claude_usage_expired(usage)
+    {
+        return Ok(usage.clone());
     }
 
-    // 初回 / 鮮度切れ / 手動 のときだけ usage でバックフィル。
-    let throttle_ok =
-        now_epoch().saturating_sub(read_last_backfill()) >= BACKFILL_THROTTLE_SECS;
+    // 両方が鮮度切れ / 初回 / 手動 のときだけ /usage でバックフィル（throttleで頻度抑制）。
+    let throttle_ok = now_epoch().saturating_sub(read_last_backfill()) >= BACKFILL_THROTTLE_SECS;
     if manual || throttle_ok {
         write_last_backfill(now_epoch());
         if let Ok(usage) = locate_claude().and_then(|path| fetch_claude_usage(&path)) {
+            // 取得できたら保存。次回以降は fresh なバックフィルとして読まれ、古い
+            // StatusLine 値に上書きされない。
+            write_claude_backfill_cache(&usage);
             return Ok(usage);
         }
     }
-    // バックフィル不可・失敗時は StatusLine（古くても）を使う。両方無ければそのエラーを返す。
-    statusline
+
+    // バックフィル不可・失敗時は手元にある最も新しい値（古くても）を返す。
+    best.map(|(usage, _)| usage).ok_or_else(|| {
+        "StatusLineデータがまだありません（Claude Codeでセッションを開くと取得されます）"
+            .to_string()
+    })
+}
+
+/// いずれかのウィンドウのリセット時刻が既に過去なら true（使用率が更新待ちで信用できない）。
+/// resets_at == 0 はエポック不明（/usage 由来など）なので過去判定の対象外。
+fn claude_usage_expired(usage: &ClaudeUsage) -> bool {
+    let now = now_epoch();
+    let passed = |window: &ClaudeWindow| window.resets_at > 0 && window.resets_at <= now;
+    passed(&usage.five_hour) || passed(&usage.seven_day)
+}
+
+/// 2 つの (使用量, 経過秒数) 候補から経過秒数の小さい（＝新しい）方を選ぶ。
+fn fresher(
+    a: Option<(ClaudeUsage, u64)>,
+    b: Option<(ClaudeUsage, u64)>,
+) -> Option<(ClaudeUsage, u64)> {
+    match (a, b) {
+        (Some(a), Some(b)) => Some(if a.1 <= b.1 { a } else { b }),
+        (some, None) | (None, some) => some,
+    }
 }
 
 fn fetch_claude_usage(claude: &Path) -> Result<ClaudeUsage, String> {
@@ -1310,6 +1345,37 @@ fn write_last_backfill(timestamp: u64) {
     let _ = std::fs::write(path, timestamp.to_string());
 }
 
+/// /usage バックフィルで取得した ClaudeUsage を保存する先（ClaudeUsage をそのまま JSON 化）。
+/// StatusLine の生 JSON とは別ファイルにし、mtime で鮮度を判定する。
+fn claude_backfill_cache_path() -> Option<PathBuf> {
+    env::var_os("HOME").map(|home| {
+        PathBuf::from(home).join("Library/Application Support/UsageBar/claude-usage-backfill.json")
+    })
+}
+
+/// バックフィルキャッシュを (使用量, 経過秒数) で読む。無ければ None。
+fn read_claude_backfill_cache() -> Option<(ClaudeUsage, u64)> {
+    let path = claude_backfill_cache_path()?;
+    let data = std::fs::read(&path).ok()?;
+    let usage: ClaudeUsage = serde_json::from_slice(&data).ok()?;
+    let modified = std::fs::metadata(&path).ok()?.modified().ok()?;
+    let age = now_epoch().saturating_sub(modified.duration_since(UNIX_EPOCH).ok()?.as_secs());
+    Some((usage, age))
+}
+
+/// バックフィル結果を保存する（書き込みで mtime が更新され、次回以降 fresh 扱いになる）。
+fn write_claude_backfill_cache(usage: &ClaudeUsage) {
+    let Some(path) = claude_backfill_cache_path() else {
+        return;
+    };
+    if let Some(directory) = path.parent() {
+        let _ = std::fs::create_dir_all(directory);
+    }
+    if let Ok(data) = serde_json::to_vec(usage) {
+        let _ = std::fs::write(path, data);
+    }
+}
+
 fn last_update_check_path() -> Option<PathBuf> {
     env::var_os("HOME").map(|home| {
         PathBuf::from(home).join("Library/Application Support/UsageBar/last-update-check")
@@ -1439,8 +1505,10 @@ fn run_statusline_capture() {
         Some((100.0 - used).round().clamp(0.0, 100.0) as u8)
     };
     if let Ok(value) = serde_json::from_str::<Value>(&input)
-        && let (Some(five), Some(seven)) =
-            (remaining(&value, "five_hour"), remaining(&value, "seven_day"))
+        && let (Some(five), Some(seven)) = (
+            remaining(&value, "five_hour"),
+            remaining(&value, "seven_day"),
+        )
     {
         println!("Claude 5h {five}% · 7d {seven}%");
     } else {
@@ -1452,7 +1520,8 @@ fn run_statusline_capture() {
 fn read_claude_statusline() -> Result<ClaudeUsage, String> {
     let path = claude_status_path().ok_or("StatusLine保存先を決定できません")?;
     let data = std::fs::read(&path).map_err(|_| {
-        "StatusLineデータがまだありません（Claude Codeでセッションを開くと取得されます）".to_string()
+        "StatusLineデータがまだありません（Claude Codeでセッションを開くと取得されます）"
+            .to_string()
     })?;
     let value: Value = serde_json::from_slice(&data)
         .map_err(|error| format!("StatusLineデータを解析できません: {error}"))?;
@@ -1468,10 +1537,7 @@ fn read_claude_statusline() -> Result<ClaudeUsage, String> {
             .get("used_percentage")
             .and_then(Value::as_f64)
             .ok_or_else(|| format!("StatusLineの{key}使用率を解析できません"))?;
-        let resets_at = window
-            .get("resets_at")
-            .and_then(Value::as_u64)
-            .unwrap_or(0);
+        let resets_at = window.get("resets_at").and_then(Value::as_u64).unwrap_or(0);
         Ok(ClaudeWindow {
             used_percent: used.round().clamp(0.0, 100.0) as u8,
             resets_label: if resets_at > 0 {
@@ -1603,6 +1669,64 @@ mod tests {
         assert_eq!(usage.five_hour.resets_label, "6:10am");
         assert_eq!(usage.seven_day.remaining_percent(), 72);
         assert_eq!(usage.seven_day.resets_label, "Jun 24 at 9am");
+    }
+
+    #[test]
+    fn fresher_prefers_newer_source() {
+        let window = |percent: u8| ClaudeWindow {
+            used_percent: percent,
+            resets_label: "x".into(),
+            resets_at: 0,
+        };
+        let usage = |percent: u8| ClaudeUsage {
+            five_hour: window(percent),
+            seven_day: window(percent),
+            plan_type: None,
+        };
+        // 新しい（経過秒数が小さい）バックフィルが、古い StatusLine に勝つ。
+        let picked = fresher(Some((usage(99), 80_000)), Some((usage(15), 60))).unwrap();
+        assert_eq!(picked.0.five_hour.used_percent, 15);
+        assert_eq!(picked.1, 60);
+        // 片方しか無ければそれを返す。
+        assert_eq!(
+            fresher(None, Some((usage(7), 10)))
+                .unwrap()
+                .0
+                .five_hour
+                .used_percent,
+            7
+        );
+        assert!(fresher(None, None).is_none());
+    }
+
+    #[test]
+    fn usage_with_passed_reset_is_expired() {
+        let window = |resets_at: u64| ClaudeWindow {
+            used_percent: 50,
+            resets_label: "x".into(),
+            resets_at,
+        };
+        // 5h ウィンドウのリセットが過去（1）なら期限切れ。
+        let expired = ClaudeUsage {
+            five_hour: window(1),
+            seven_day: window(u64::MAX),
+            plan_type: None,
+        };
+        assert!(claude_usage_expired(&expired));
+        // 両ウィンドウとも未来なら期限切れではない。
+        let live = ClaudeUsage {
+            five_hour: window(u64::MAX),
+            seven_day: window(u64::MAX),
+            plan_type: None,
+        };
+        assert!(!claude_usage_expired(&live));
+        // resets_at == 0（エポック不明）は過去扱いしない。
+        let unknown = ClaudeUsage {
+            five_hour: window(0),
+            seven_day: window(0),
+            plan_type: None,
+        };
+        assert!(!claude_usage_expired(&unknown));
     }
 
     #[test]
