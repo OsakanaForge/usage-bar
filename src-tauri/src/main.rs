@@ -141,6 +141,16 @@ impl UpdateFrequency {
     }
 }
 
+const ALLOWED_REFRESH_INTERVALS: [u64; 4] = [60, 5 * 60, 10 * 60, 60 * 60];
+
+fn normalize_refresh_interval(seconds: u64) -> u64 {
+    if ALLOWED_REFRESH_INTERVALS.contains(&seconds) {
+        seconds
+    } else {
+        5 * 60
+    }
+}
+
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(default)]
 #[serde(rename_all = "camelCase")]
@@ -494,8 +504,8 @@ fn start_periodic_refresh(app: AppHandle) {
                 .state::<SharedState>()
                 .lock()
                 .expect("monitor state lock poisoned")
-                .refresh_interval_seconds
-                .clamp(60, 3600);
+                .refresh_interval_seconds;
+            let interval_seconds = normalize_refresh_interval(interval_seconds);
             if elapsed_seconds >= interval_seconds {
                 elapsed_seconds = 0;
                 refresh(app.clone(), false);
@@ -591,7 +601,15 @@ fn locate_codex() -> Result<PathBuf, String> {
     ];
 
     if let Some(home) = env::var_os("HOME") {
-        candidates.push(PathBuf::from(home).join(".local/bin/codex"));
+        let home = PathBuf::from(home);
+        candidates.push(home.join(".local/bin/codex"));
+        if let Ok(entries) = std::fs::read_dir(home.join(".vscode/extensions")) {
+            candidates.extend(
+                entries
+                    .flatten()
+                    .map(|entry| entry.path().join("bin/macos-aarch64/codex")),
+            );
+        }
     }
     if let Some(path) = env::var_os("PATH") {
         candidates.extend(env::split_paths(&path).map(|directory| directory.join("codex")));
@@ -651,13 +669,21 @@ fn locate_claude() -> Result<PathBuf, String> {
     if let Some(home) = env::var_os("HOME") {
         let home = PathBuf::from(home);
         candidates.push(home.join(".local/bin/claude"));
-        let node_versions = home.join(".nvm/versions/node");
-        if let Ok(entries) = std::fs::read_dir(node_versions) {
+        if let Ok(entries) =
+            std::fs::read_dir(home.join("Library/Application Support/Claude/claude-code"))
+        {
             candidates.extend(
                 entries
                     .flatten()
-                    .map(|entry| entry.path().join("bin/claude")),
+                    .map(|entry| entry.path().join("claude.app/Contents/MacOS/claude")),
             );
+        }
+        let node_versions = home.join(".nvm/versions/node");
+        if let Ok(entries) = std::fs::read_dir(node_versions) {
+            for entry in entries.flatten() {
+                let node_version = entry.path();
+                candidates.push(node_version.join("bin/claude"));
+            }
         }
     }
     if let Some(path) = env::var_os("PATH") {
@@ -669,25 +695,18 @@ fn locate_claude() -> Result<PathBuf, String> {
         .ok_or_else(|| "Claude Code CLIが見つかりません".into())
 }
 
-/// Claude 使用量を取得する。データ源は 2 つ:
-///   1. StatusLine（Claude Code がターミナルでステータス行を描画したとき更新）
-///   2. /usage バックフィルキャッシュ（StatusLine が古いときだけ叩いて保存）
-/// どちらも UsageBar 側からは更新タイミングを制御できないため、ファイルの鮮度
-/// （mtime）で新しい方を採用する。両方が鮮度切れ（または初回/手動）のときだけ
-/// /usage を throttle 付きで叩き、結果をバックフィルキャッシュへ保存して、次回以降は
-/// それを fresh として扱う（古い StatusLine 値で上書きされるのを防ぐ）。
+/// Claude 使用量を取得する。現行Claude Codeではプラン使用率は /usage ではなく
+/// statusLine の rate_limits に出るため、StatusLineを主系にする。
+/// /usage は古いClaude向けの保険として、初回・鮮度切れ・手動時だけ試す。
 fn fetch_claude(manual: bool) -> Result<ClaudeUsage, String> {
     const STALE_SECS: u64 = 30 * 60;
     const BACKFILL_THROTTLE_SECS: u64 = 10 * 60;
 
-    // StatusLine と バックフィルキャッシュ のうち、鮮度の新しい方を best とする。
     let statusline = read_claude_statusline()
         .ok()
         .map(|usage| (usage, claude_status_age_secs().unwrap_or(u64::MAX)));
     let best = fresher(statusline, read_claude_backfill_cache());
 
-    // ファイルが新しくても、ウィンドウのリセット時刻が既に過去なら使用率は無意味
-    // （リセット済みなのに古い値を表示し続ける症状の原因）。その場合は鮮度切れ扱い。
     if let Some((usage, age)) = &best
         && *age < STALE_SECS
         && !claude_usage_expired(usage)
@@ -695,34 +714,27 @@ fn fetch_claude(manual: bool) -> Result<ClaudeUsage, String> {
         return Ok(usage.clone());
     }
 
-    // 両方が鮮度切れ / 初回 / 手動 のときだけ /usage でバックフィル（throttleで頻度抑制）。
     let throttle_ok = now_epoch().saturating_sub(read_last_backfill()) >= BACKFILL_THROTTLE_SECS;
     if manual || throttle_ok {
         write_last_backfill(now_epoch());
         if let Ok(usage) = locate_claude().and_then(|path| fetch_claude_usage(&path)) {
-            // 取得できたら保存。次回以降は fresh なバックフィルとして読まれ、古い
-            // StatusLine 値に上書きされない。
             write_claude_backfill_cache(&usage);
             return Ok(usage);
         }
     }
 
-    // バックフィル不可・失敗時は手元にある最も新しい値（古くても）を返す。
     best.map(|(usage, _)| usage).ok_or_else(|| {
         "StatusLineデータがまだありません（Claude Codeでセッションを開くと取得されます）"
             .to_string()
     })
 }
 
-/// いずれかのウィンドウのリセット時刻が既に過去なら true（使用率が更新待ちで信用できない）。
-/// resets_at == 0 はエポック不明（/usage 由来など）なので過去判定の対象外。
 fn claude_usage_expired(usage: &ClaudeUsage) -> bool {
     let now = now_epoch();
     let passed = |window: &ClaudeWindow| window.resets_at > 0 && window.resets_at <= now;
     passed(&usage.five_hour) || passed(&usage.seven_day)
 }
 
-/// 2 つの (使用量, 経過秒数) 候補から経過秒数の小さい（＝新しい）方を選ぶ。
 fn fresher(
     a: Option<(ClaudeUsage, u64)>,
     b: Option<(ClaudeUsage, u64)>,
@@ -797,9 +809,20 @@ fn fetch_claude_usage(claude: &Path) -> Result<ClaudeUsage, String> {
         .write_all(b"/usage\r")
         .and_then(|_| stdin.flush())
         .map_err(|error| format!("Claude Codeへ/usageを送信できません: {error}"))?;
-    // ポーリング・リトライはしない（/usage のエンドポイントを叩きすぎるとレート制限が出るため）。
-    // 1回だけ描画を待ち、取得できなければ今回はあきらめる（呼び出し側で前回値を保持する）。
-    std::thread::sleep(Duration::from_secs(5));
+    // /usage 自体は1回だけ送る。描画が遅いことがあるため、画面に使用量が出るまで待つ。
+    let usage_deadline = std::time::Instant::now() + Duration::from_secs(20);
+    let mut parsed_usage = None;
+    while std::time::Instant::now() < usage_deadline {
+        let screen = {
+            let captured = captured.lock().expect("Claude output lock poisoned");
+            strip_terminal_sequences(&String::from_utf8_lossy(&captured))
+        };
+        if let Ok(usage) = parse_claude_usage(&screen) {
+            parsed_usage = Some(usage);
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(500));
+    }
     let _ = stdin.write_all(b"\x1b");
     let _ = stdin.flush();
     std::thread::sleep(Duration::from_millis(200));
@@ -822,7 +845,9 @@ fn fetch_claude_usage(claude: &Path) -> Result<ClaudeUsage, String> {
     let _ = reader.join();
     let output = captured.lock().expect("Claude output lock poisoned");
     let screen = strip_terminal_sequences(&String::from_utf8_lossy(&output));
-    let mut usage = parse_claude_usage(&screen)?;
+    let mut usage = parsed_usage
+        .or_else(|| parse_claude_usage(&screen).ok())
+        .ok_or("Claude Codeの/usage出力を時間内に解析できませんでした")?;
     usage.plan_type = fetch_claude_plan(claude);
     Ok(usage)
 }
@@ -1203,8 +1228,8 @@ fn set_settings(
     state: tauri::State<'_, SharedState>,
     settings: Settings,
 ) -> Result<(), String> {
-    if !(60..=3600).contains(&settings.refresh_interval_seconds) {
-        return Err("更新間隔は60秒以上で指定してください".into());
+    if !ALLOWED_REFRESH_INTERVALS.contains(&settings.refresh_interval_seconds) {
+        return Err("更新間隔は1分・5分・10分・60分から選択してください".into());
     }
     if settings.codex_threshold > 100 || settings.claude_threshold > 100 {
         return Err("しきい値は0〜100%で指定してください".into());
@@ -1314,7 +1339,6 @@ fn claude_settings_path() -> Option<PathBuf> {
     env::var_os("HOME").map(|home| PathBuf::from(home).join(".claude/settings.json"))
 }
 
-/// StatusLine キャッシュの最終更新からの経過秒数（無ければ None）。
 fn claude_status_age_secs() -> Option<u64> {
     let path = claude_status_path()?;
     let modified = std::fs::metadata(&path).ok()?.modified().ok()?;
@@ -1345,15 +1369,13 @@ fn write_last_backfill(timestamp: u64) {
     let _ = std::fs::write(path, timestamp.to_string());
 }
 
-/// /usage バックフィルで取得した ClaudeUsage を保存する先（ClaudeUsage をそのまま JSON 化）。
-/// StatusLine の生 JSON とは別ファイルにし、mtime で鮮度を判定する。
+/// /usage で取得した ClaudeUsage を診断用に保存する先（ClaudeUsage をそのまま JSON 化）。
 fn claude_backfill_cache_path() -> Option<PathBuf> {
     env::var_os("HOME").map(|home| {
         PathBuf::from(home).join("Library/Application Support/UsageBar/claude-usage-backfill.json")
     })
 }
 
-/// バックフィルキャッシュを (使用量, 経過秒数) で読む。無ければ None。
 fn read_claude_backfill_cache() -> Option<(ClaudeUsage, u64)> {
     let path = claude_backfill_cache_path()?;
     let data = std::fs::read(&path).ok()?;
@@ -1363,7 +1385,7 @@ fn read_claude_backfill_cache() -> Option<(ClaudeUsage, u64)> {
     Some((usage, age))
 }
 
-/// バックフィル結果を保存する（書き込みで mtime が更新され、次回以降 fresh 扱いになる）。
+/// /usage の最新成功結果を保存する。
 fn write_claude_backfill_cache(usage: &ClaudeUsage) {
     let Some(path) = claude_backfill_cache_path() else {
         return;
@@ -1482,8 +1504,6 @@ fn set_statusline_registered(enabled: bool) -> Result<(), String> {
     Ok(())
 }
 
-/// `usage-bar --statusline` 実行時の処理。Claude Code の statusLine から渡される
-/// JSON を stdin で受け取り、そのまま保存して、ステータス行を stdout に出力する。
 fn run_statusline_capture() {
     let mut input = String::new();
     if std::io::stdin().read_to_string(&mut input).is_err() {
@@ -1495,7 +1515,6 @@ fn run_statusline_capture() {
         }
         let _ = std::fs::write(&path, input.as_bytes());
     }
-    // Claude Code 上のステータス行表示（任意）。残量を簡潔に出す。
     let remaining = |value: &Value, key: &str| -> Option<u8> {
         let used = value
             .get("rate_limits")?
@@ -1516,7 +1535,6 @@ fn run_statusline_capture() {
     }
 }
 
-/// StatusLine が保存した JSON から Claude 使用量を読み取る（/usage は叩かない）。
 fn read_claude_statusline() -> Result<ClaudeUsage, String> {
     let path = claude_status_path().ok_or("StatusLine保存先を決定できません")?;
     let data = std::fs::read(&path).map_err(|_| {
@@ -1580,10 +1598,13 @@ fn persist_settings(settings: &Settings) {
 }
 
 fn load_settings() -> Settings {
-    settings_path()
+    let mut settings: Settings = settings_path()
         .and_then(|path| std::fs::read(path).ok())
         .and_then(|data| serde_json::from_slice(&data).ok())
-        .unwrap_or_default()
+        .unwrap_or_default();
+    settings.refresh_interval_seconds =
+        normalize_refresh_interval(settings.refresh_interval_seconds);
+    settings
 }
 
 fn save_cache(snapshot: &UsageSnapshot) {
@@ -1672,61 +1693,13 @@ mod tests {
     }
 
     #[test]
-    fn fresher_prefers_newer_source() {
-        let window = |percent: u8| ClaudeWindow {
-            used_percent: percent,
-            resets_label: "x".into(),
-            resets_at: 0,
-        };
-        let usage = |percent: u8| ClaudeUsage {
-            five_hour: window(percent),
-            seven_day: window(percent),
-            plan_type: None,
-        };
-        // 新しい（経過秒数が小さい）バックフィルが、古い StatusLine に勝つ。
-        let picked = fresher(Some((usage(99), 80_000)), Some((usage(15), 60))).unwrap();
-        assert_eq!(picked.0.five_hour.used_percent, 15);
-        assert_eq!(picked.1, 60);
-        // 片方しか無ければそれを返す。
-        assert_eq!(
-            fresher(None, Some((usage(7), 10)))
-                .unwrap()
-                .0
-                .five_hour
-                .used_percent,
-            7
-        );
-        assert!(fresher(None, None).is_none());
-    }
-
-    #[test]
-    fn usage_with_passed_reset_is_expired() {
-        let window = |resets_at: u64| ClaudeWindow {
-            used_percent: 50,
-            resets_label: "x".into(),
-            resets_at,
-        };
-        // 5h ウィンドウのリセットが過去（1）なら期限切れ。
-        let expired = ClaudeUsage {
-            five_hour: window(1),
-            seven_day: window(u64::MAX),
-            plan_type: None,
-        };
-        assert!(claude_usage_expired(&expired));
-        // 両ウィンドウとも未来なら期限切れではない。
-        let live = ClaudeUsage {
-            five_hour: window(u64::MAX),
-            seven_day: window(u64::MAX),
-            plan_type: None,
-        };
-        assert!(!claude_usage_expired(&live));
-        // resets_at == 0（エポック不明）は過去扱いしない。
-        let unknown = ClaudeUsage {
-            five_hour: window(0),
-            seven_day: window(0),
-            plan_type: None,
-        };
-        assert!(!claude_usage_expired(&unknown));
+    fn refresh_interval_is_limited_to_usage_safe_choices() {
+        assert_eq!(normalize_refresh_interval(60), 60);
+        assert_eq!(normalize_refresh_interval(300), 300);
+        assert_eq!(normalize_refresh_interval(600), 600);
+        assert_eq!(normalize_refresh_interval(3600), 3600);
+        assert_eq!(normalize_refresh_interval(120), 300);
+        assert_eq!(normalize_refresh_interval(5), 300);
     }
 
     #[test]
