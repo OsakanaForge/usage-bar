@@ -2,8 +2,11 @@
 
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
+#[cfg(unix)]
+use std::os::unix::fs::OpenOptionsExt;
 use std::{
     env,
+    fs::OpenOptions,
     io::{BufRead, BufReader, Read, Write},
     path::{Path, PathBuf},
     process::{Command, Stdio},
@@ -19,6 +22,7 @@ use tauri::{
 use tauri_plugin_updater::UpdaterExt;
 
 const TRAY_ID: &str = "codex-usage";
+const MAX_STATUSLINE_INPUT_BYTES: u64 = 256 * 1024;
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -63,6 +67,24 @@ struct ClaudeUsage {
     five_hour: ClaudeWindow,
     seven_day: ClaudeWindow,
     plan_type: Option<String>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+struct ClaudeStatuslineWindow {
+    used_percentage: f64,
+    #[serde(default)]
+    resets_at: u64,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+struct ClaudeStatuslineRateLimits {
+    five_hour: ClaudeStatuslineWindow,
+    seven_day: ClaudeStatuslineWindow,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+struct ClaudeStatuslineCache {
+    rate_limits: ClaudeStatuslineRateLimits,
 }
 
 #[derive(Debug, Deserialize)]
@@ -1346,6 +1368,50 @@ fn claude_status_age_secs() -> Option<u64> {
     Some(now_epoch().saturating_sub(modified_epoch))
 }
 
+/// 同じディレクトリの一時ファイルを経由して、所有者だけが読める状態で置換する。
+fn write_private_atomic(path: &Path, data: &[u8]) -> std::io::Result<()> {
+    let directory = path.parent().ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "保存先に親ディレクトリがありません",
+        )
+    })?;
+    std::fs::create_dir_all(directory)?;
+
+    let file_name = path
+        .file_name()
+        .ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "保存先にファイル名がありません",
+            )
+        })?
+        .to_string_lossy();
+    let nonce = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    let temporary = directory.join(format!(".{file_name}.{}.{}.tmp", std::process::id(), nonce));
+
+    let result = (|| {
+        let mut options = OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
+        options.mode(0o600);
+
+        let mut file = options.open(&temporary)?;
+        file.write_all(data)?;
+        file.sync_all()?;
+        drop(file);
+        std::fs::rename(&temporary, path)
+    })();
+
+    if result.is_err() {
+        let _ = std::fs::remove_file(&temporary);
+    }
+    result
+}
+
 fn last_backfill_path() -> Option<PathBuf> {
     env::var_os("HOME").map(|home| {
         PathBuf::from(home).join("Library/Application Support/UsageBar/last-claude-backfill")
@@ -1423,35 +1489,69 @@ fn write_last_update_check(timestamp: u64) {
 
 /// このアプリ自身を呼ぶ statusLine コマンド文字列（インストール先に追従）。
 fn statusline_command_string() -> String {
-    let exe = std::env::current_exe()
-        .ok()
-        .and_then(|path| path.to_str().map(str::to_string))
-        .unwrap_or_else(|| "usage-bar".to_string());
-    format!("{exe} --statusline")
+    let exe = std::env::current_exe().unwrap_or_else(|_| PathBuf::from("usage-bar"));
+    statusline_command_for_exe(&exe)
+}
+
+/// 任意のUTF-8文字列をPOSIX shellの単一引数として安全に引用する。
+fn shell_quote(argument: &str) -> String {
+    format!("'{}'", argument.replace('\'', "'\\''"))
+}
+
+fn statusline_command_for_exe(exe: &Path) -> String {
+    let exe = exe.to_str().unwrap_or("usage-bar");
+    format!("{} --statusline", shell_quote(exe))
+}
+
+fn is_current_statusline_command(command: &str, exe: &Path) -> bool {
+    command == statusline_command_for_exe(exe)
+}
+
+/// 現行の安全な形式と、旧版が保存した未引用の完全一致形式だけをUsageBar所有とみなす。
+fn is_owned_statusline_command(command: &str, exe: &Path) -> bool {
+    if is_current_statusline_command(command, exe) {
+        return true;
+    }
+    exe.to_str()
+        .map(|exe| command == format!("{exe} --statusline"))
+        .unwrap_or(false)
+}
+
+fn configured_statusline_command() -> Option<String> {
+    let path = claude_settings_path()?;
+    let data = std::fs::read(path).ok()?;
+    let value: Value = serde_json::from_slice(&data).ok()?;
+    value
+        .get("statusLine")?
+        .get("command")?
+        .as_str()
+        .map(str::to_string)
 }
 
 /// ~/.claude/settings.json に UsageBar の statusLine が登録済みか。
 fn is_statusline_registered() -> bool {
-    let Some(path) = claude_settings_path() else {
+    let Ok(exe) = std::env::current_exe() else {
         return false;
     };
-    let Ok(data) = std::fs::read(&path) else {
-        return false;
-    };
-    let Ok(value) = serde_json::from_slice::<Value>(&data) else {
-        return false;
-    };
-    value
-        .get("statusLine")
-        .and_then(|line| line.get("command"))
-        .and_then(Value::as_str)
-        .map(|command| command.contains("--statusline"))
+    configured_statusline_command()
+        .as_deref()
+        .map(|command| is_current_statusline_command(command, &exe))
         .unwrap_or(false)
 }
 
 /// ~/.claude/settings.json の statusLine を登録/解除する。既存のキーは保持する。
 fn set_statusline_registered(enabled: bool) -> Result<(), String> {
-    if enabled == is_statusline_registered() {
+    let current_exe = std::env::current_exe()
+        .map_err(|error| format!("実行ファイルのパスを取得できません: {error}"))?;
+    if enabled {
+        if is_statusline_registered() {
+            return Ok(());
+        }
+    } else if !configured_statusline_command()
+        .as_deref()
+        .map(|command| is_owned_statusline_command(command, &current_exe))
+        .unwrap_or(false)
+    {
         return Ok(());
     }
     let path = claude_settings_path().ok_or("~/.claude/settings.json のパスを決定できません")?;
@@ -1486,7 +1586,7 @@ fn set_statusline_registered(enabled: bool) -> Result<(), String> {
             .get("statusLine")
             .and_then(|line| line.get("command"))
             .and_then(Value::as_str)
-            .map(|command| command.contains("--statusline"))
+            .map(|command| is_owned_statusline_command(command, &current_exe))
             .unwrap_or(false);
         if ours {
             object.remove("statusLine");
@@ -1499,36 +1599,42 @@ fn set_statusline_registered(enabled: bool) -> Result<(), String> {
     }
     let data = serde_json::to_vec_pretty(&value)
         .map_err(|error| format!("settings.json を生成できません: {error}"))?;
-    std::fs::write(&path, data)
+    write_private_atomic(&path, &data)
         .map_err(|error| format!("settings.json を書き込めません: {error}"))?;
     Ok(())
 }
 
+fn read_statusline_input(reader: impl Read) -> Result<Vec<u8>, String> {
+    let mut input = Vec::new();
+    reader
+        .take(MAX_STATUSLINE_INPUT_BYTES + 1)
+        .read_to_end(&mut input)
+        .map_err(|error| format!("StatusLine入力を読めません: {error}"))?;
+    if input.len() as u64 > MAX_STATUSLINE_INPUT_BYTES {
+        return Err("StatusLine入力が大きすぎます".to_string());
+    }
+    Ok(input)
+}
+
+fn parse_claude_statusline(input: &[u8]) -> Result<ClaudeStatuslineCache, String> {
+    serde_json::from_slice(input)
+        .map_err(|error| format!("StatusLineデータを解析できません: {error}"))
+}
+
 fn run_statusline_capture() {
-    let mut input = String::new();
-    if std::io::stdin().read_to_string(&mut input).is_err() {
+    let Ok(input) = read_statusline_input(std::io::stdin().lock()) else {
+        println!("UsageBar");
         return;
-    }
-    if let Some(path) = claude_status_path() {
-        if let Some(directory) = path.parent() {
-            let _ = std::fs::create_dir_all(directory);
-        }
-        let _ = std::fs::write(&path, input.as_bytes());
-    }
-    let remaining = |value: &Value, key: &str| -> Option<u8> {
-        let used = value
-            .get("rate_limits")?
-            .get(key)?
-            .get("used_percentage")?
-            .as_f64()?;
-        Some((100.0 - used).round().clamp(0.0, 100.0) as u8)
     };
-    if let Ok(value) = serde_json::from_str::<Value>(&input)
-        && let (Some(five), Some(seven)) = (
-            remaining(&value, "five_hour"),
-            remaining(&value, "seven_day"),
-        )
-    {
+    if let Ok(cache) = parse_claude_statusline(&input) {
+        if let Some(path) = claude_status_path()
+            && let Ok(data) = serde_json::to_vec(&cache)
+        {
+            let _ = write_private_atomic(&path, &data);
+        }
+        let remaining = |used: f64| (100.0 - used).round().clamp(0.0, 100.0) as u8;
+        let five = remaining(cache.rate_limits.five_hour.used_percentage);
+        let seven = remaining(cache.rate_limits.seven_day.used_percentage);
         println!("Claude 5h {five}% · 7d {seven}%");
     } else {
         println!("UsageBar");
@@ -1541,35 +1647,21 @@ fn read_claude_statusline() -> Result<ClaudeUsage, String> {
         "StatusLineデータがまだありません（Claude Codeでセッションを開くと取得されます）"
             .to_string()
     })?;
-    let value: Value = serde_json::from_slice(&data)
-        .map_err(|error| format!("StatusLineデータを解析できません: {error}"))?;
-    let rate_limits = value
-        .get("rate_limits")
-        .ok_or("StatusLineにrate_limitsがありません（対象プラン/初回応答後に付与されます）")?;
+    let cache = parse_claude_statusline(&data)?;
 
-    let window = |key: &str| -> Result<ClaudeWindow, String> {
-        let window = rate_limits
-            .get(key)
-            .ok_or_else(|| format!("StatusLineに{key}がありません"))?;
-        let used = window
-            .get("used_percentage")
-            .and_then(Value::as_f64)
-            .ok_or_else(|| format!("StatusLineの{key}使用率を解析できません"))?;
-        let resets_at = window.get("resets_at").and_then(Value::as_u64).unwrap_or(0);
-        Ok(ClaudeWindow {
-            used_percent: used.round().clamp(0.0, 100.0) as u8,
-            resets_label: if resets_at > 0 {
-                format_reset_time(resets_at)
-            } else {
-                "不明".to_string()
-            },
-            resets_at,
-        })
+    let window = |window: &ClaudeStatuslineWindow| ClaudeWindow {
+        used_percent: window.used_percentage.round().clamp(0.0, 100.0) as u8,
+        resets_label: if window.resets_at > 0 {
+            format_reset_time(window.resets_at)
+        } else {
+            "不明".to_string()
+        },
+        resets_at: window.resets_at,
     };
 
     Ok(ClaudeUsage {
-        five_hour: window("five_hour")?,
-        seven_day: window("seven_day")?,
+        five_hour: window(&cache.rate_limits.five_hour),
+        seven_day: window(&cache.rate_limits.seven_day),
         plan_type: None,
     })
 }
@@ -1709,6 +1801,108 @@ mod tests {
         assert_eq!(settings.refresh_interval_seconds, 60);
         assert_eq!(settings.codex_threshold, 0);
         assert_eq!(settings.claude_threshold, 0);
+    }
+
+    #[test]
+    fn posix_shell_quote_handles_spaces_and_single_quotes() {
+        assert_eq!(shell_quote("/tmp/Usage Bar"), "'/tmp/Usage Bar'");
+        assert_eq!(
+            shell_quote("/tmp/Usage Bar's executable"),
+            "'/tmp/Usage Bar'\\''s executable'"
+        );
+    }
+
+    #[test]
+    fn statusline_command_quotes_shell_metacharacters() {
+        let exe = Path::new("/tmp/Usage Bar;$(touch pwned)");
+        assert_eq!(
+            statusline_command_for_exe(exe),
+            "'/tmp/Usage Bar;$(touch pwned)' --statusline"
+        );
+    }
+
+    #[test]
+    fn statusline_ownership_requires_an_exact_usagebar_command() {
+        let exe = Path::new("/Applications/Usage Bar.app/Contents/MacOS/usage-bar");
+        let current = statusline_command_for_exe(exe);
+        let legacy = format!("{} --statusline", exe.display());
+
+        assert!(is_current_statusline_command(&current, exe));
+        assert!(is_owned_statusline_command(&current, exe));
+        assert!(
+            !is_current_statusline_command(&legacy, exe),
+            "legacy command should be rewritten to the quoted form when enabled"
+        );
+        assert!(
+            is_owned_statusline_command(&legacy, exe),
+            "legacy command remains removable during migration"
+        );
+
+        for foreign in [
+            "printf --statusline",
+            "other-tool --statusline",
+            "'/Applications/Usage Bar.app/Contents/MacOS/usage-bar' --statusline; touch /tmp/pwned",
+            "env DEBUG=1 '/Applications/Usage Bar.app/Contents/MacOS/usage-bar' --statusline",
+        ] {
+            assert!(!is_owned_statusline_command(foreign, exe), "{foreign}");
+        }
+    }
+
+    #[test]
+    fn statusline_cache_persists_only_required_rate_limit_fields() {
+        let input = br#"{
+            "session_id": "sensitive-session-id",
+            "transcript_path": "/private/transcript.jsonl",
+            "cwd": "/private/project",
+            "rate_limits": {
+                "five_hour": {
+                    "used_percentage": 12.5,
+                    "resets_at": 1781723293,
+                    "extra": "discard me"
+                },
+                "seven_day": {
+                    "used_percentage": 34,
+                    "resets_at": 1782310093
+                },
+                "overage": {"enabled": true}
+            }
+        }"#;
+
+        let cache = parse_claude_statusline(input).unwrap();
+        let persisted: Value =
+            serde_json::from_slice(&serde_json::to_vec(&cache).unwrap()).unwrap();
+        assert_eq!(
+            persisted,
+            json!({
+                "rate_limits": {
+                    "five_hour": {
+                        "used_percentage": 12.5,
+                        "resets_at": 1781723293u64
+                    },
+                    "seven_day": {
+                        "used_percentage": 34.0,
+                        "resets_at": 1782310093u64
+                    }
+                }
+            })
+        );
+        assert!(persisted.get("session_id").is_none());
+        assert!(persisted.get("transcript_path").is_none());
+        assert!(persisted.get("cwd").is_none());
+    }
+
+    #[test]
+    fn statusline_input_is_bounded() {
+        let at_limit = vec![b'x'; MAX_STATUSLINE_INPUT_BYTES as usize];
+        assert_eq!(
+            read_statusline_input(std::io::Cursor::new(&at_limit))
+                .unwrap()
+                .len(),
+            at_limit.len()
+        );
+
+        let over_limit = vec![b'x'; MAX_STATUSLINE_INPUT_BYTES as usize + 1];
+        assert!(read_statusline_input(std::io::Cursor::new(over_limit)).is_err());
     }
 
     #[test]
