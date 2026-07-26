@@ -73,8 +73,8 @@ src-tauri/target/release/bundle/dmg/UsageBar_<version>_aarch64.dmg
 
 ## リリース
 
-自動更新の成果物は `v*` タグをpushするとGitHub ActionsがReleasesへ公開します。
-リリース前に、Tauri updaterの秘密鍵とパスワードをGitHub ActionsのSecretsへ登録してください。
+`main` にマージ済みのコミットへ保護された `v*` タグをpushすると、承認後にGitHub Actionsが自動更新の成果物をReleasesへ公開します。
+リリース前に、Tauri updaterの秘密鍵とパスワードをGitHubの `release` EnvironmentのSecretsへ登録してください。
 
 - `TAURI_SIGNING_PRIVATE_KEY`: `.tauri/usage-bar.key` の内容
 - `TAURI_SIGNING_PRIVATE_KEY_PASSWORD`: 鍵生成時に設定したパスワード（今回生成した鍵では不要）
