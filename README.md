@@ -9,7 +9,7 @@ Dockには表示されない常駐型（メニューバー）アプリです。
 - メニューバーに5時間枠の残量を表示（`Codex 94% · Claude 96%` の数字表示、またはサービスごとの円形ゲージ表示を切替可能）
 - クリックで週間残量、リセット時刻、プラン、取得状態を確認
 - 残量がしきい値以下になったときのmacOS通知（Codex・Claudeごとに個別設定、0で無効）
-- 自動更新間隔の設定（1分・5分・10分・60分）
+- 自動更新間隔の設定（5分・10分・15分・20分・30分）
 - 手動更新
 - GitHub Releasesからの署名検証付き自動更新
 
@@ -47,7 +47,10 @@ codex login
 ```
 
 Claude Codeは擬似端末内で `/usage` を開き、その表示から使用率とリセット時刻を取得します。
-KeychainのOAuth資格情報は直接読みません。Claude Codeが未導入・未ログインの場合は、先に次を実行してください。
+通常の取得ではKeychainのOAuth資格情報や `~/.claude/settings.json` を直接読み書きしません。
+v0.1.5以前から更新した場合に限り、旧版のUsageBar自身が登録した `statusLine` 設定を
+初回起動時に解除します。他のStatusLine設定は変更しません。
+Claude Codeが未導入・未ログインの場合は、先に次を実行してください。
 
 ```bash
 npm install -g @anthropic-ai/claude-code
