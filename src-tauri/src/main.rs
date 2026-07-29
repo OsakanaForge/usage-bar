@@ -34,6 +34,22 @@ impl RateLimitWindow {
     fn remaining_percent(&self) -> u8 {
         (100.0 - self.used_percent).round().clamp(0.0, 100.0) as u8
     }
+
+    /// 枠の名前は位置（primary/secondary）ではなく実際の長さから決める。
+    /// Codexは枠の構成を変えることがあり、primary＝5時間とは限らない。
+    fn window_label(&self) -> String {
+        const DAY_MINS: u64 = 24 * 60;
+        match self.window_duration_mins {
+            0 => "枠".to_string(),
+            mins if mins % (7 * DAY_MINS) == 0 => match mins / (7 * DAY_MINS) {
+                1 => "週間".to_string(),
+                weeks => format!("{weeks}週間"),
+            },
+            mins if mins % DAY_MINS == 0 => format!("{}日", mins / DAY_MINS),
+            mins if mins % 60 == 0 => format!("{}時間", mins / 60),
+            mins => format!("{mins}分"),
+        }
+    }
 }
 
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]
@@ -44,13 +60,30 @@ struct RateLimits {
     plan_type: Option<String>,
 }
 
+impl RateLimits {
+    fn windows(&self) -> impl Iterator<Item = &RateLimitWindow> {
+        [self.primary.as_ref(), self.secondary.as_ref()]
+            .into_iter()
+            .flatten()
+    }
+
+    /// メニューバーとしきい値通知に使う枠。
+    /// 一番短い枠＝いま枯れると困る枠なので、それを代表値にする。
+    fn headline(&self) -> Option<&RateLimitWindow> {
+        self.windows()
+            .min_by_key(|window| window.window_duration_mins)
+    }
+}
+
+/// `/usage` はリセット時刻を "1:10am" / "Aug 5 at 6pm" のような表示文字列でしか出さない。
+/// 解析できなかったときはこの値を入れ、リセット判定の材料から除外する。
+const UNKNOWN_RESET_LABEL: &str = "不明";
+
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct ClaudeWindow {
     used_percent: u8,
     resets_label: String,
-    #[serde(default)]
-    resets_at: u64,
 }
 
 impl ClaudeWindow {
@@ -108,10 +141,8 @@ struct MonitorState {
     codex_enabled: bool,
     claude_enabled: bool,
     update_frequency: UpdateFrequency,
-    five_hour_reset_at: u64,
-    five_hour_reset_notified: bool,
-    seven_day_reset_at: u64,
-    seven_day_reset_notified: bool,
+    five_hour_reset_label: Option<String>,
+    seven_day_reset_label: Option<String>,
 }
 
 type SharedState = Arc<Mutex<MonitorState>>;
@@ -343,7 +374,7 @@ fn refresh(app: AppHandle) {
                         if claude_enabled && snapshot.claude_usage.is_none() {
                             snapshot.claude_usage = previous.claude_usage.clone();
                         }
-                        if codex_enabled && snapshot.rate_limits.primary.is_none() {
+                        if codex_enabled && snapshot.rate_limits.headline().is_none() {
                             snapshot.rate_limits = previous.rate_limits.clone();
                         }
                     }
@@ -368,7 +399,9 @@ fn refresh(app: AppHandle) {
 }
 
 /// Claude のトークン枠（5時間/週間）がリセットされたら通知を返す。
-/// resets_at(epoch) を追跡し、その時刻を過ぎたら一度だけ通知する。
+/// `/usage` は次のリセット時刻を表示文字列でしか出さない（epochは取れない）ため、
+/// **「リセット時刻の表示が別の値に変わった＝新しい枠が始まった」**をリセットとみなす。
+/// 通知の発火は毎回 refresh の中なので、epochを持っても検知の粒度は変わらない。
 fn reset_notifications(state: &mut MonitorState) -> Vec<(String, String)> {
     let mut out = Vec::new();
     let Some(usage) = state
@@ -378,23 +411,18 @@ fn reset_notifications(state: &mut MonitorState) -> Vec<(String, String)> {
     else {
         return out;
     };
-    let five = usage.five_hour.resets_at;
-    let seven = usage.seven_day.resets_at;
-    let now = now_epoch();
+    let five = usage.five_hour.resets_label.clone();
+    let seven = usage.seven_day.resets_label.clone();
     check_reset(
         "Claudeの5時間枠",
-        five,
-        now,
-        &mut state.five_hour_reset_at,
-        &mut state.five_hour_reset_notified,
+        &five,
+        &mut state.five_hour_reset_label,
         &mut out,
     );
     check_reset(
         "Claudeの週間枠",
-        seven,
-        now,
-        &mut state.seven_day_reset_at,
-        &mut state.seven_day_reset_notified,
+        &seven,
+        &mut state.seven_day_reset_label,
         &mut out,
     );
     out
@@ -402,26 +430,25 @@ fn reset_notifications(state: &mut MonitorState) -> Vec<(String, String)> {
 
 fn check_reset(
     name: &str,
-    resets_at: u64,
-    now: u64,
-    tracked: &mut u64,
-    notified: &mut bool,
+    label: &str,
+    tracked: &mut Option<String>,
     out: &mut Vec<(String, String)>,
 ) {
-    if resets_at == 0 {
-        return; // epoch不明（usageスクレイプ等）は対象外。
+    // 解析できなかった枠は判定に使わない（誤通知と、追跡値の巻き戻りを防ぐ）。
+    if label.is_empty() || label == UNKNOWN_RESET_LABEL {
+        return;
     }
-    // 新しい枠を観測したら再アーム。既に過ぎている枠なら通知済み扱い（起動時の誤通知防止）。
-    if resets_at > *tracked {
-        *tracked = resets_at;
-        *notified = now >= resets_at;
-    }
-    if *tracked != 0 && now >= *tracked && !*notified {
-        *notified = true;
-        out.push((
-            "UsageBar".to_string(),
-            format!("{name}がリセットされました（利用可能になりました）"),
-        ));
+    match tracked {
+        // 初回観測（起動直後・キャッシュ復帰）は記録するだけで通知しない。
+        None => *tracked = Some(label.to_string()),
+        Some(previous) if previous != label => {
+            *tracked = Some(label.to_string());
+            out.push((
+                "UsageBar".to_string(),
+                format!("{name}がリセットされました（利用可能になりました）"),
+            ));
+        }
+        Some(_) => {}
     }
 }
 
@@ -431,8 +458,7 @@ fn pending_notifications(state: &mut MonitorState) -> Vec<(String, String)> {
     };
     let codex_remaining = snapshot
         .rate_limits
-        .primary
-        .as_ref()
+        .headline()
         .map(RateLimitWindow::remaining_percent);
     let claude_remaining = snapshot
         .claude_usage
@@ -646,7 +672,7 @@ fn fetch_all_usage(
 
     // 有効なサービスがすべて取得失敗したときだけエラーにする（無効なら静かに空で返す）。
     if !errors.is_empty()
-        && snapshot.rate_limits.primary.is_none()
+        && snapshot.rate_limits.headline().is_none()
         && snapshot.claude_usage.is_none()
     {
         return Err(errors.join(" / "));
@@ -942,14 +968,12 @@ fn parse_claude_usage(screen: &str) -> Result<ClaudeUsage, String> {
             resets_label: session
                 .split_whitespace()
                 .find(|word| is_clock_time(word))
-                .unwrap_or("不明")
+                .unwrap_or(UNKNOWN_RESET_LABEL)
                 .to_string(),
-            resets_at: 0,
         },
         seven_day: ClaudeWindow {
             used_percent: percent_before_used(week)?,
-            resets_label: extract_week_reset(week).unwrap_or_else(|| "不明".into()),
-            resets_at: 0,
+            resets_label: extract_week_reset(week).unwrap_or_else(|| UNKNOWN_RESET_LABEL.into()),
         },
         plan_type: None,
     })
@@ -997,7 +1021,7 @@ fn update_tray(app: &AppHandle, state: &SharedState) {
     let codex_remaining = snapshot
         .latest
         .as_ref()
-        .and_then(|value| value.rate_limits.primary.as_ref())
+        .and_then(|value| value.rate_limits.headline())
         .map(RateLimitWindow::remaining_percent);
     let claude_remaining = snapshot
         .latest
@@ -1052,11 +1076,8 @@ fn build_menu(app: &AppHandle, state: &SharedState) -> tauri::Result<Menu<tauri:
     } else if state.refreshing {
         items.push(Box::new(disabled_item(app, "更新中...")?));
     } else if let Some(snapshot) = &state.latest {
-        if let Some(primary) = &snapshot.rate_limits.primary {
-            add_window_items(app, &mut items, "5時間", primary)?;
-        }
-        if let Some(secondary) = &snapshot.rate_limits.secondary {
-            add_window_items(app, &mut items, "週間", secondary)?;
+        for window in snapshot.rate_limits.windows() {
+            add_window_items(app, &mut items, &window.window_label(), window)?;
         }
         items.push(Box::new(disabled_item(app, "状態: 正確")?));
         if let Some(plan) = &snapshot.rate_limits.plan_type {
@@ -1559,6 +1580,46 @@ mod tests {
         assert_eq!(under.remaining_percent(), 100);
     }
 
+    fn window(used_percent: f64, window_duration_mins: u64) -> RateLimitWindow {
+        RateLimitWindow {
+            used_percent,
+            window_duration_mins,
+            resets_at: 0,
+        }
+    }
+
+    #[test]
+    fn window_label_comes_from_the_actual_duration() {
+        assert_eq!(window(0.0, 300).window_label(), "5時間");
+        assert_eq!(window(0.0, 10080).window_label(), "週間");
+        assert_eq!(window(0.0, 1440).window_label(), "1日");
+        assert_eq!(window(0.0, 20160).window_label(), "2週間");
+        assert_eq!(window(0.0, 45).window_label(), "45分");
+        assert_eq!(window(0.0, 0).window_label(), "枠");
+    }
+
+    #[test]
+    fn headline_is_the_shortest_window_regardless_of_position() {
+        // primaryが週間・secondaryが5時間でも、代表値は短い方（5時間）を使う。
+        let limits = RateLimits {
+            primary: Some(window(10.0, 10080)),
+            secondary: Some(window(40.0, 300)),
+            plan_type: None,
+        };
+        assert_eq!(limits.headline().unwrap().remaining_percent(), 60);
+
+        // 週間枠しか返ってこない構成でも、それを代表値として拾う（primary固定だと取りこぼす）。
+        let weekly_only = RateLimits {
+            primary: None,
+            secondary: Some(window(25.0, 10080)),
+            plan_type: None,
+        };
+        assert_eq!(weekly_only.headline().unwrap().remaining_percent(), 75);
+        assert_eq!(weekly_only.windows().count(), 1);
+
+        assert!(RateLimits::default().headline().is_none());
+    }
+
     #[test]
     fn parses_rate_limit_response() {
         let response: RpcResponse = serde_json::from_value(json!({
@@ -1702,6 +1763,49 @@ mod tests {
 
         check_threshold("Codex", Some(10), 20, &mut notified, &mut out);
         assert_eq!(out.len(), 2, "notifies again after recovery");
+    }
+
+    #[test]
+    fn reset_notifies_once_when_the_window_rolls_over() {
+        let mut out = Vec::new();
+        let mut tracked = None;
+
+        // 初回観測は記録だけ（起動直後に鳴らさない）。
+        check_reset("Claudeの5時間枠", "1:10am", &mut tracked, &mut out);
+        assert!(out.is_empty());
+        assert_eq!(tracked.as_deref(), Some("1:10am"));
+
+        // 同じ枠を見ている間は鳴らない。
+        check_reset("Claudeの5時間枠", "1:10am", &mut tracked, &mut out);
+        assert!(out.is_empty());
+
+        // 新しい枠に変わったら1回だけ鳴る。
+        check_reset("Claudeの5時間枠", "6:10am", &mut tracked, &mut out);
+        assert_eq!(out.len(), 1);
+        assert!(out[0].1.contains("リセットされました"));
+        check_reset("Claudeの5時間枠", "6:10am", &mut tracked, &mut out);
+        assert_eq!(out.len(), 1, "same window must not re-notify");
+    }
+
+    #[test]
+    fn reset_ignores_unparsed_labels() {
+        let mut out = Vec::new();
+        let mut tracked = Some("6:10am".to_string());
+
+        // 解析失敗は判定に使わず、追跡値も巻き戻さない。
+        check_reset(
+            "Claudeの5時間枠",
+            UNKNOWN_RESET_LABEL,
+            &mut tracked,
+            &mut out,
+        );
+        check_reset("Claudeの5時間枠", "", &mut tracked, &mut out);
+        assert!(out.is_empty());
+        assert_eq!(tracked.as_deref(), Some("6:10am"));
+
+        // 解析に戻ったとき、同じ枠なら誤通知しない。
+        check_reset("Claudeの5時間枠", "6:10am", &mut tracked, &mut out);
+        assert!(out.is_empty());
     }
 
     #[test]
