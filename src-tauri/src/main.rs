@@ -22,8 +22,6 @@ use tauri::{
 use tauri_plugin_updater::UpdaterExt;
 
 const TRAY_ID: &str = "codex-usage";
-const MAX_STATUSLINE_INPUT_BYTES: u64 = 256 * 1024;
-
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct RateLimitWindow {
@@ -36,6 +34,22 @@ impl RateLimitWindow {
     fn remaining_percent(&self) -> u8 {
         (100.0 - self.used_percent).round().clamp(0.0, 100.0) as u8
     }
+
+    /// 枠の名前は位置（primary/secondary）ではなく実際の長さから決める。
+    /// Codexは枠の構成を変えることがあり、primary＝5時間とは限らない。
+    fn window_label(&self) -> String {
+        const DAY_MINS: u64 = 24 * 60;
+        match self.window_duration_mins {
+            0 => "枠".to_string(),
+            mins if mins % (7 * DAY_MINS) == 0 => match mins / (7 * DAY_MINS) {
+                1 => "週間".to_string(),
+                weeks => format!("{weeks}週間"),
+            },
+            mins if mins % DAY_MINS == 0 => format!("{}日", mins / DAY_MINS),
+            mins if mins % 60 == 0 => format!("{}時間", mins / 60),
+            mins => format!("{mins}分"),
+        }
+    }
 }
 
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]
@@ -46,13 +60,30 @@ struct RateLimits {
     plan_type: Option<String>,
 }
 
+impl RateLimits {
+    fn windows(&self) -> impl Iterator<Item = &RateLimitWindow> {
+        [self.primary.as_ref(), self.secondary.as_ref()]
+            .into_iter()
+            .flatten()
+    }
+
+    /// メニューバーとしきい値通知に使う枠。
+    /// 一番短い枠＝いま枯れると困る枠なので、それを代表値にする。
+    fn headline(&self) -> Option<&RateLimitWindow> {
+        self.windows()
+            .min_by_key(|window| window.window_duration_mins)
+    }
+}
+
+/// `/usage` はリセット時刻を "1:10am" / "Aug 5 at 6pm" のような表示文字列でしか出さない。
+/// 解析できなかったときはこの値を入れ、リセット判定の材料から除外する。
+const UNKNOWN_RESET_LABEL: &str = "不明";
+
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct ClaudeWindow {
     used_percent: u8,
     resets_label: String,
-    #[serde(default)]
-    resets_at: u64,
 }
 
 impl ClaudeWindow {
@@ -67,24 +98,6 @@ struct ClaudeUsage {
     five_hour: ClaudeWindow,
     seven_day: ClaudeWindow,
     plan_type: Option<String>,
-}
-
-#[derive(Clone, Debug, Deserialize, Serialize)]
-struct ClaudeStatuslineWindow {
-    used_percentage: f64,
-    #[serde(default)]
-    resets_at: u64,
-}
-
-#[derive(Clone, Debug, Deserialize, Serialize)]
-struct ClaudeStatuslineRateLimits {
-    five_hour: ClaudeStatuslineWindow,
-    seven_day: ClaudeStatuslineWindow,
-}
-
-#[derive(Clone, Debug, Deserialize, Serialize)]
-struct ClaudeStatuslineCache {
-    rate_limits: ClaudeStatuslineRateLimits,
 }
 
 #[derive(Debug, Deserialize)]
@@ -128,10 +141,8 @@ struct MonitorState {
     codex_enabled: bool,
     claude_enabled: bool,
     update_frequency: UpdateFrequency,
-    five_hour_reset_at: u64,
-    five_hour_reset_notified: bool,
-    seven_day_reset_at: u64,
-    seven_day_reset_notified: bool,
+    five_hour_reset_label: Option<String>,
+    seven_day_reset_label: Option<String>,
 }
 
 type SharedState = Arc<Mutex<MonitorState>>;
@@ -163,14 +174,13 @@ impl UpdateFrequency {
     }
 }
 
-const ALLOWED_REFRESH_INTERVALS: [u64; 4] = [60, 5 * 60, 10 * 60, 60 * 60];
+const ALLOWED_REFRESH_INTERVALS: [u64; 5] = [5 * 60, 10 * 60, 15 * 60, 20 * 60, 30 * 60];
 
 fn normalize_refresh_interval(seconds: u64) -> u64 {
-    if ALLOWED_REFRESH_INTERVALS.contains(&seconds) {
-        seconds
-    } else {
-        5 * 60
-    }
+    ALLOWED_REFRESH_INTERVALS
+        .into_iter()
+        .min_by_key(|allowed| allowed.abs_diff(seconds))
+        .unwrap_or(5 * 60)
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -198,7 +208,7 @@ impl Default for Settings {
     fn default() -> Self {
         Self {
             display_mode: DisplayMode::Number,
-            refresh_interval_seconds: 60,
+            refresh_interval_seconds: 5 * 60,
             codex_threshold: 0,
             claude_threshold: 0,
             codex_enabled: true,
@@ -212,7 +222,7 @@ impl Default for Settings {
 fn main() {
     let show_settings_on_launch = env::args().any(|argument| argument == "--settings");
     if env::args().any(|argument| argument == "--probe") {
-        let result = fetch_all_usage(true, true, true);
+        let result = fetch_all_usage(true, true);
         match result {
             Ok((snapshot, warning)) => {
                 println!(
@@ -229,13 +239,6 @@ fn main() {
                 std::process::exit(1);
             }
         }
-    }
-
-    // Claude Code の statusLine から渡されるJSONを受け取り、rate_limits をキャッシュへ保存する。
-    // （Claude Code が呼び出す: usage-bar --statusline ）
-    if env::args().any(|argument| argument == "--statusline") {
-        run_statusline_capture();
-        return;
     }
 
     tauri::Builder::default()
@@ -266,8 +269,9 @@ fn main() {
             let settings = load_settings();
             // ログイン時起動の実状態を設定値に合わせる（初回はデフォルトONで有効化される）。
             apply_launch_at_login(app.handle(), settings.launch_at_login);
-            // Claude監視がONなら statusLine を自動登録（デフォルトON・設定画面には出さない）。
-            let _ = set_statusline_registered(settings.claude_enabled);
+            // v0.1.5以前が登録したUsageBar所有のstatusLineだけを一度解除する。
+            // 既存の他ツール・ユーザー設定は変更しない。
+            let _ = remove_owned_statusline_registration();
             let state = Arc::new(Mutex::new(MonitorState {
                 latest: load_cache(),
                 display_mode: settings.display_mode,
@@ -290,14 +294,14 @@ fn main() {
                 .title("Codex ...")
                 .menu(&initial_menu)
                 .on_menu_event(|app, event| match event.id.as_ref() {
-                    "refresh" => refresh(app.clone(), true),
+                    "refresh" => refresh(app.clone()),
                     "settings" => show_settings_window(app),
                     "quit" => app.exit(0),
                     _ => {}
                 })
                 .build(app)?;
 
-            refresh(app.handle().clone(), false);
+            refresh(app.handle().clone());
             start_periodic_refresh(app.handle().clone());
             // 設定の確認頻度に達していれば自動更新チェックを実行。
             if now_epoch().saturating_sub(read_last_update_check())
@@ -344,7 +348,7 @@ async fn download_available_update(
     Ok(Some(version))
 }
 
-fn refresh(app: AppHandle, manual: bool) {
+fn refresh(app: AppHandle) {
     let state = app.state::<SharedState>().inner().clone();
     let (codex_enabled, claude_enabled) = {
         let mut current = state.lock().expect("monitor state lock poisoned");
@@ -358,7 +362,7 @@ fn refresh(app: AppHandle, manual: bool) {
     update_tray(&app, &state);
 
     tauri::async_runtime::spawn_blocking(move || {
-        let result = fetch_all_usage(codex_enabled, claude_enabled, manual);
+        let result = fetch_all_usage(codex_enabled, claude_enabled);
         let notifications = {
             let mut current = state.lock().expect("monitor state lock poisoned");
             current.refreshing = false;
@@ -370,7 +374,7 @@ fn refresh(app: AppHandle, manual: bool) {
                         if claude_enabled && snapshot.claude_usage.is_none() {
                             snapshot.claude_usage = previous.claude_usage.clone();
                         }
-                        if codex_enabled && snapshot.rate_limits.primary.is_none() {
+                        if codex_enabled && snapshot.rate_limits.headline().is_none() {
                             snapshot.rate_limits = previous.rate_limits.clone();
                         }
                     }
@@ -395,7 +399,9 @@ fn refresh(app: AppHandle, manual: bool) {
 }
 
 /// Claude のトークン枠（5時間/週間）がリセットされたら通知を返す。
-/// resets_at(epoch) を追跡し、その時刻を過ぎたら一度だけ通知する。
+/// `/usage` は次のリセット時刻を表示文字列でしか出さない（epochは取れない）ため、
+/// **「リセット時刻の表示が別の値に変わった＝新しい枠が始まった」**をリセットとみなす。
+/// 通知の発火は毎回 refresh の中なので、epochを持っても検知の粒度は変わらない。
 fn reset_notifications(state: &mut MonitorState) -> Vec<(String, String)> {
     let mut out = Vec::new();
     let Some(usage) = state
@@ -405,23 +411,18 @@ fn reset_notifications(state: &mut MonitorState) -> Vec<(String, String)> {
     else {
         return out;
     };
-    let five = usage.five_hour.resets_at;
-    let seven = usage.seven_day.resets_at;
-    let now = now_epoch();
+    let five = usage.five_hour.resets_label.clone();
+    let seven = usage.seven_day.resets_label.clone();
     check_reset(
         "Claudeの5時間枠",
-        five,
-        now,
-        &mut state.five_hour_reset_at,
-        &mut state.five_hour_reset_notified,
+        &five,
+        &mut state.five_hour_reset_label,
         &mut out,
     );
     check_reset(
         "Claudeの週間枠",
-        seven,
-        now,
-        &mut state.seven_day_reset_at,
-        &mut state.seven_day_reset_notified,
+        &seven,
+        &mut state.seven_day_reset_label,
         &mut out,
     );
     out
@@ -429,26 +430,25 @@ fn reset_notifications(state: &mut MonitorState) -> Vec<(String, String)> {
 
 fn check_reset(
     name: &str,
-    resets_at: u64,
-    now: u64,
-    tracked: &mut u64,
-    notified: &mut bool,
+    label: &str,
+    tracked: &mut Option<String>,
     out: &mut Vec<(String, String)>,
 ) {
-    if resets_at == 0 {
-        return; // epoch不明（usageスクレイプ等）は対象外。
+    // 解析できなかった枠は判定に使わない（誤通知と、追跡値の巻き戻りを防ぐ）。
+    if label.is_empty() || label == UNKNOWN_RESET_LABEL {
+        return;
     }
-    // 新しい枠を観測したら再アーム。既に過ぎている枠なら通知済み扱い（起動時の誤通知防止）。
-    if resets_at > *tracked {
-        *tracked = resets_at;
-        *notified = now >= resets_at;
-    }
-    if *tracked != 0 && now >= *tracked && !*notified {
-        *notified = true;
-        out.push((
-            "UsageBar".to_string(),
-            format!("{name}がリセットされました（利用可能になりました）"),
-        ));
+    match tracked {
+        // 初回観測（起動直後・キャッシュ復帰）は記録するだけで通知しない。
+        None => *tracked = Some(label.to_string()),
+        Some(previous) if previous != label => {
+            *tracked = Some(label.to_string());
+            out.push((
+                "UsageBar".to_string(),
+                format!("{name}がリセットされました（利用可能になりました）"),
+            ));
+        }
+        Some(_) => {}
     }
 }
 
@@ -458,8 +458,7 @@ fn pending_notifications(state: &mut MonitorState) -> Vec<(String, String)> {
     };
     let codex_remaining = snapshot
         .rate_limits
-        .primary
-        .as_ref()
+        .headline()
         .map(RateLimitWindow::remaining_percent);
     let claude_remaining = snapshot
         .claude_usage
@@ -530,7 +529,7 @@ fn start_periodic_refresh(app: AppHandle) {
             let interval_seconds = normalize_refresh_interval(interval_seconds);
             if elapsed_seconds >= interval_seconds {
                 elapsed_seconds = 0;
-                refresh(app.clone(), false);
+                refresh(app.clone());
             }
         }
     });
@@ -646,7 +645,6 @@ fn locate_codex() -> Result<PathBuf, String> {
 fn fetch_all_usage(
     codex_enabled: bool,
     claude_enabled: bool,
-    manual: bool,
 ) -> Result<(UsageSnapshot, Option<String>), String> {
     let mut errors = Vec::new();
     let mut snapshot = UsageSnapshot {
@@ -666,7 +664,7 @@ fn fetch_all_usage(
     }
 
     if claude_enabled {
-        match fetch_claude(manual) {
+        match fetch_claude() {
             Ok(usage) => snapshot.claude_usage = Some(usage),
             Err(error) => errors.push(error),
         }
@@ -674,7 +672,7 @@ fn fetch_all_usage(
 
     // 有効なサービスがすべて取得失敗したときだけエラーにする（無効なら静かに空で返す）。
     if !errors.is_empty()
-        && snapshot.rate_limits.primary.is_none()
+        && snapshot.rate_limits.headline().is_none()
         && snapshot.claude_usage.is_none()
     {
         return Err(errors.join(" / "));
@@ -717,54 +715,10 @@ fn locate_claude() -> Result<PathBuf, String> {
         .ok_or_else(|| "Claude Code CLIが見つかりません".into())
 }
 
-/// Claude 使用量を取得する。現行Claude Codeではプラン使用率は /usage ではなく
-/// statusLine の rate_limits に出るため、StatusLineを主系にする。
-/// /usage は古いClaude向けの保険として、初回・鮮度切れ・手動時だけ試す。
-fn fetch_claude(manual: bool) -> Result<ClaudeUsage, String> {
-    const STALE_SECS: u64 = 30 * 60;
-    const BACKFILL_THROTTLE_SECS: u64 = 10 * 60;
-
-    let statusline = read_claude_statusline()
-        .ok()
-        .map(|usage| (usage, claude_status_age_secs().unwrap_or(u64::MAX)));
-    let best = fresher(statusline, read_claude_backfill_cache());
-
-    if let Some((usage, age)) = &best
-        && *age < STALE_SECS
-        && !claude_usage_expired(usage)
-    {
-        return Ok(usage.clone());
-    }
-
-    let throttle_ok = now_epoch().saturating_sub(read_last_backfill()) >= BACKFILL_THROTTLE_SECS;
-    if manual || throttle_ok {
-        write_last_backfill(now_epoch());
-        if let Ok(usage) = locate_claude().and_then(|path| fetch_claude_usage(&path)) {
-            write_claude_backfill_cache(&usage);
-            return Ok(usage);
-        }
-    }
-
-    best.map(|(usage, _)| usage).ok_or_else(|| {
-        "StatusLineデータがまだありません（Claude Codeでセッションを開くと取得されます）"
-            .to_string()
-    })
-}
-
-fn claude_usage_expired(usage: &ClaudeUsage) -> bool {
-    let now = now_epoch();
-    let passed = |window: &ClaudeWindow| window.resets_at > 0 && window.resets_at <= now;
-    passed(&usage.five_hour) || passed(&usage.seven_day)
-}
-
-fn fresher(
-    a: Option<(ClaudeUsage, u64)>,
-    b: Option<(ClaudeUsage, u64)>,
-) -> Option<(ClaudeUsage, u64)> {
-    match (a, b) {
-        (Some(a), Some(b)) => Some(if a.1 <= b.1 { a } else { b }),
-        (some, None) | (None, some) => some,
-    }
+/// Claude CodeをPTYで起動し、`/usage`の表示から使用量を取得する。
+/// OAuth資格情報や`~/.claude/settings.json`は直接読み書きしない。
+fn fetch_claude() -> Result<ClaudeUsage, String> {
+    locate_claude().and_then(|path| fetch_claude_usage(&path))
 }
 
 fn fetch_claude_usage(claude: &Path) -> Result<ClaudeUsage, String> {
@@ -776,10 +730,13 @@ fn fetch_claude_usage(claude: &Path) -> Result<ClaudeUsage, String> {
         .ok_or("Claude Code用ディレクトリを決定できません")?;
     std::fs::create_dir_all(&probe_directory)
         .map_err(|error| format!("Claude Code用ディレクトリを作成できません: {error}"))?;
+    let session_id = new_probe_session_id();
     let mut child = Command::new("/usr/bin/script")
         .args(["-q", "/dev/null"])
         .arg(claude)
-        .arg("--safe-mode")
+        .args(["--allowed-tools", ""])
+        .args(["--settings", r#"{"disableAllHooks":true}"#])
+        .args(["--session-id", &session_id])
         .current_dir(probe_directory)
         .env("TERM", "xterm-256color")
         .stdin(Stdio::piped())
@@ -867,11 +824,80 @@ fn fetch_claude_usage(claude: &Path) -> Result<ClaudeUsage, String> {
     let _ = reader.join();
     let output = captured.lock().expect("Claude output lock poisoned");
     let screen = strip_terminal_sequences(&String::from_utf8_lossy(&output));
-    let mut usage = parsed_usage
+    let result = parsed_usage
         .or_else(|| parse_claude_usage(&screen).ok())
-        .ok_or("Claude Codeの/usage出力を時間内に解析できませんでした")?;
-    usage.plan_type = fetch_claude_plan(claude);
-    Ok(usage)
+        .ok_or_else(|| claude_usage_error(&screen))
+        .map(|mut usage| {
+            usage.plan_type = fetch_claude_plan(claude);
+            usage
+        });
+    cleanup_claude_probe_session(&session_id);
+    result
+}
+
+fn claude_usage_error(screen: &str) -> String {
+    if screen.contains("API Usage Billing")
+        || (screen.contains("Total cost:") && screen.contains("Usage:"))
+    {
+        "Claudeの5時間・週間使用量を取得できません。Claude.aiのPro/Maxプランでログインしているか確認してください"
+            .to_string()
+    } else {
+        "Claude Codeの/usage出力を時間内に解析できませんでした".to_string()
+    }
+}
+
+fn new_probe_session_id() -> String {
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    let seed = nanos ^ (u128::from(std::process::id()) << 96);
+    format!(
+        "{:08x}-{:04x}-4{:03x}-8{:03x}-{:012x}",
+        (seed >> 96) as u32,
+        (seed >> 80) as u16,
+        (seed >> 68) & 0x0fff,
+        (seed >> 56) & 0x0fff,
+        seed & 0xffff_ffff_ffff
+    )
+}
+
+/// 監視用セッションだけをClaude Codeの履歴から除去する。
+/// 対象はUsageBarが生成したUUIDと完全一致するファイル・ディレクトリに限定する。
+fn cleanup_claude_probe_session(session_id: &str) {
+    let mut config_roots = Vec::new();
+    if let Some(config_dirs) = env::var_os("CLAUDE_CONFIG_DIR") {
+        config_roots.extend(
+            config_dirs
+                .to_string_lossy()
+                .split(',')
+                .filter(|value| !value.is_empty())
+                .map(PathBuf::from),
+        );
+    }
+    if let Some(home) = env::var_os("HOME") {
+        let home = PathBuf::from(home);
+        config_roots.push(home.join(".claude"));
+        config_roots.push(home.join(".config/claude"));
+    }
+
+    for projects_root in config_roots
+        .into_iter()
+        .map(|root| root.join("projects"))
+        .filter(|root| root.is_dir())
+    {
+        let Ok(projects) = std::fs::read_dir(projects_root) else {
+            continue;
+        };
+        for project in projects.flatten().filter(|entry| entry.path().is_dir()) {
+            let project_path = project.path();
+            let _ = std::fs::remove_file(project_path.join(format!("{session_id}.jsonl")));
+            let session_directory = project_path.join(session_id);
+            if session_directory.is_dir() {
+                let _ = std::fs::remove_dir_all(session_directory);
+            }
+        }
+    }
 }
 
 fn fetch_claude_plan(claude: &Path) -> Option<String> {
@@ -942,14 +968,12 @@ fn parse_claude_usage(screen: &str) -> Result<ClaudeUsage, String> {
             resets_label: session
                 .split_whitespace()
                 .find(|word| is_clock_time(word))
-                .unwrap_or("不明")
+                .unwrap_or(UNKNOWN_RESET_LABEL)
                 .to_string(),
-            resets_at: 0,
         },
         seven_day: ClaudeWindow {
             used_percent: percent_before_used(week)?,
-            resets_label: extract_week_reset(week).unwrap_or_else(|| "不明".into()),
-            resets_at: 0,
+            resets_label: extract_week_reset(week).unwrap_or_else(|| UNKNOWN_RESET_LABEL.into()),
         },
         plan_type: None,
     })
@@ -997,7 +1021,7 @@ fn update_tray(app: &AppHandle, state: &SharedState) {
     let codex_remaining = snapshot
         .latest
         .as_ref()
-        .and_then(|value| value.rate_limits.primary.as_ref())
+        .and_then(|value| value.rate_limits.headline())
         .map(RateLimitWindow::remaining_percent);
     let claude_remaining = snapshot
         .latest
@@ -1052,11 +1076,8 @@ fn build_menu(app: &AppHandle, state: &SharedState) -> tauri::Result<Menu<tauri:
     } else if state.refreshing {
         items.push(Box::new(disabled_item(app, "更新中...")?));
     } else if let Some(snapshot) = &state.latest {
-        if let Some(primary) = &snapshot.rate_limits.primary {
-            add_window_items(app, &mut items, "5時間", primary)?;
-        }
-        if let Some(secondary) = &snapshot.rate_limits.secondary {
-            add_window_items(app, &mut items, "週間", secondary)?;
+        for window in snapshot.rate_limits.windows() {
+            add_window_items(app, &mut items, &window.window_label(), window)?;
         }
         items.push(Box::new(disabled_item(app, "状態: 正確")?));
         if let Some(plan) = &snapshot.rate_limits.plan_type {
@@ -1251,7 +1272,7 @@ fn set_settings(
     settings: Settings,
 ) -> Result<(), String> {
     if !ALLOWED_REFRESH_INTERVALS.contains(&settings.refresh_interval_seconds) {
-        return Err("更新間隔は1分・5分・10分・60分から選択してください".into());
+        return Err("更新間隔は5分・10分・15分・20分・30分から選択してください".into());
     }
     if settings.codex_threshold > 100 || settings.claude_threshold > 100 {
         return Err("しきい値は0〜100%で指定してください".into());
@@ -1282,12 +1303,10 @@ fn set_settings(
             }
         }
     }
-    // Claude監視のON/OFFに連動して statusLine を登録/解除（~/.claude/settings.json を更新）。
-    let _ = set_statusline_registered(settings.claude_enabled);
     persist_settings(&settings);
     update_tray(&app, state.inner());
     // 有効に戻したサービスをすぐ取得しにいく。
-    refresh(app.clone(), false);
+    refresh(app.clone());
     Ok(())
 }
 
@@ -1351,21 +1370,8 @@ fn cache_path() -> Option<PathBuf> {
         .map(|home| PathBuf::from(home).join("Library/Application Support/UsageBar/status.json"))
 }
 
-fn claude_status_path() -> Option<PathBuf> {
-    env::var_os("HOME").map(|home| {
-        PathBuf::from(home).join("Library/Application Support/UsageBar/claude-status.json")
-    })
-}
-
 fn claude_settings_path() -> Option<PathBuf> {
     env::var_os("HOME").map(|home| PathBuf::from(home).join(".claude/settings.json"))
-}
-
-fn claude_status_age_secs() -> Option<u64> {
-    let path = claude_status_path()?;
-    let modified = std::fs::metadata(&path).ok()?.modified().ok()?;
-    let modified_epoch = modified.duration_since(UNIX_EPOCH).ok()?.as_secs();
-    Some(now_epoch().saturating_sub(modified_epoch))
 }
 
 /// 同じディレクトリの一時ファイルを経由して、所有者だけが読める状態で置換する。
@@ -1412,58 +1418,6 @@ fn write_private_atomic(path: &Path, data: &[u8]) -> std::io::Result<()> {
     result
 }
 
-fn last_backfill_path() -> Option<PathBuf> {
-    env::var_os("HOME").map(|home| {
-        PathBuf::from(home).join("Library/Application Support/UsageBar/last-claude-backfill")
-    })
-}
-
-fn read_last_backfill() -> u64 {
-    last_backfill_path()
-        .and_then(|path| std::fs::read_to_string(path).ok())
-        .and_then(|text| text.trim().parse::<u64>().ok())
-        .unwrap_or(0)
-}
-
-fn write_last_backfill(timestamp: u64) {
-    let Some(path) = last_backfill_path() else {
-        return;
-    };
-    if let Some(directory) = path.parent() {
-        let _ = std::fs::create_dir_all(directory);
-    }
-    let _ = std::fs::write(path, timestamp.to_string());
-}
-
-/// /usage で取得した ClaudeUsage を診断用に保存する先（ClaudeUsage をそのまま JSON 化）。
-fn claude_backfill_cache_path() -> Option<PathBuf> {
-    env::var_os("HOME").map(|home| {
-        PathBuf::from(home).join("Library/Application Support/UsageBar/claude-usage-backfill.json")
-    })
-}
-
-fn read_claude_backfill_cache() -> Option<(ClaudeUsage, u64)> {
-    let path = claude_backfill_cache_path()?;
-    let data = std::fs::read(&path).ok()?;
-    let usage: ClaudeUsage = serde_json::from_slice(&data).ok()?;
-    let modified = std::fs::metadata(&path).ok()?.modified().ok()?;
-    let age = now_epoch().saturating_sub(modified.duration_since(UNIX_EPOCH).ok()?.as_secs());
-    Some((usage, age))
-}
-
-/// /usage の最新成功結果を保存する。
-fn write_claude_backfill_cache(usage: &ClaudeUsage) {
-    let Some(path) = claude_backfill_cache_path() else {
-        return;
-    };
-    if let Some(directory) = path.parent() {
-        let _ = std::fs::create_dir_all(directory);
-    }
-    if let Ok(data) = serde_json::to_vec(usage) {
-        let _ = std::fs::write(path, data);
-    }
-}
-
 fn last_update_check_path() -> Option<PathBuf> {
     env::var_os("HOME").map(|home| {
         PathBuf::from(home).join("Library/Application Support/UsageBar/last-update-check")
@@ -1485,12 +1439,6 @@ fn write_last_update_check(timestamp: u64) {
         let _ = std::fs::create_dir_all(directory);
     }
     let _ = std::fs::write(path, timestamp.to_string());
-}
-
-/// このアプリ自身を呼ぶ statusLine コマンド文字列（インストール先に追従）。
-fn statusline_command_string() -> String {
-    let exe = std::env::current_exe().unwrap_or_else(|_| PathBuf::from("usage-bar"));
-    statusline_command_for_exe(&exe)
 }
 
 /// 任意のUTF-8文字列をPOSIX shellの単一引数として安全に引用する。
@@ -1517,153 +1465,40 @@ fn is_owned_statusline_command(command: &str, exe: &Path) -> bool {
         .unwrap_or(false)
 }
 
-fn configured_statusline_command() -> Option<String> {
-    let path = claude_settings_path()?;
-    let data = std::fs::read(path).ok()?;
-    let value: Value = serde_json::from_slice(&data).ok()?;
-    value
-        .get("statusLine")?
-        .get("command")?
-        .as_str()
-        .map(str::to_string)
-}
-
-/// ~/.claude/settings.json に UsageBar の statusLine が登録済みか。
-fn is_statusline_registered() -> bool {
-    let Ok(exe) = std::env::current_exe() else {
-        return false;
-    };
-    configured_statusline_command()
-        .as_deref()
-        .map(|command| is_current_statusline_command(command, &exe))
-        .unwrap_or(false)
-}
-
-/// ~/.claude/settings.json の statusLine を登録/解除する。既存のキーは保持する。
-fn set_statusline_registered(enabled: bool) -> Result<(), String> {
+/// v0.1.5以前が登録したUsageBar所有のstatusLineだけを解除する。
+/// 他ツール・ユーザー自身のstatusLineは読み取るだけで変更しない。
+fn remove_owned_statusline_registration() -> Result<(), String> {
     let current_exe = std::env::current_exe()
         .map_err(|error| format!("実行ファイルのパスを取得できません: {error}"))?;
-    if enabled {
-        if is_statusline_registered() {
-            return Ok(());
-        }
-    } else if !configured_statusline_command()
-        .as_deref()
-        .map(|command| is_owned_statusline_command(command, &current_exe))
-        .unwrap_or(false)
-    {
+    let path = claude_settings_path().ok_or("~/.claude/settings.json のパスを決定できません")?;
+    if !path.exists() {
         return Ok(());
     }
-    let path = claude_settings_path().ok_or("~/.claude/settings.json のパスを決定できません")?;
-    let mut value: Value = if path.exists() {
-        let data =
-            std::fs::read(&path).map_err(|error| format!("settings.json を読めません: {error}"))?;
-        serde_json::from_slice(&data)
-            .map_err(|error| format!("settings.json を解析できません: {error}"))?
-    } else {
-        json!({})
-    };
+    let data =
+        std::fs::read(&path).map_err(|error| format!("settings.json を読めません: {error}"))?;
+    let mut value: Value = serde_json::from_slice(&data)
+        .map_err(|error| format!("settings.json を解析できません: {error}"))?;
     let object = value
         .as_object_mut()
         .ok_or("settings.json の形式が不正です")?;
+    let ours = object
+        .get("statusLine")
+        .and_then(|line| line.get("command"))
+        .and_then(Value::as_str)
+        .map(|command| is_owned_statusline_command(command, &current_exe))
+        .unwrap_or(false);
+    if !ours {
+        return Ok(());
+    }
 
     // 変更前にバックアップを残す。
-    if path.exists() {
-        let _ = std::fs::copy(&path, path.with_extension("json.usagebar-bak"));
-    }
-
-    if enabled {
-        object.insert(
-            "statusLine".to_string(),
-            json!({
-                "type": "command",
-                "command": statusline_command_string(),
-            }),
-        );
-    } else {
-        // UsageBar が登録した statusLine のときだけ削除する。
-        let ours = object
-            .get("statusLine")
-            .and_then(|line| line.get("command"))
-            .and_then(Value::as_str)
-            .map(|command| is_owned_statusline_command(command, &current_exe))
-            .unwrap_or(false);
-        if ours {
-            object.remove("statusLine");
-        }
-    }
-
-    if let Some(directory) = path.parent() {
-        std::fs::create_dir_all(directory)
-            .map_err(|error| format!("~/.claude を作成できません: {error}"))?;
-    }
+    let _ = std::fs::copy(&path, path.with_extension("json.usagebar-bak"));
+    object.remove("statusLine");
     let data = serde_json::to_vec_pretty(&value)
         .map_err(|error| format!("settings.json を生成できません: {error}"))?;
     write_private_atomic(&path, &data)
         .map_err(|error| format!("settings.json を書き込めません: {error}"))?;
     Ok(())
-}
-
-fn read_statusline_input(reader: impl Read) -> Result<Vec<u8>, String> {
-    let mut input = Vec::new();
-    reader
-        .take(MAX_STATUSLINE_INPUT_BYTES + 1)
-        .read_to_end(&mut input)
-        .map_err(|error| format!("StatusLine入力を読めません: {error}"))?;
-    if input.len() as u64 > MAX_STATUSLINE_INPUT_BYTES {
-        return Err("StatusLine入力が大きすぎます".to_string());
-    }
-    Ok(input)
-}
-
-fn parse_claude_statusline(input: &[u8]) -> Result<ClaudeStatuslineCache, String> {
-    serde_json::from_slice(input)
-        .map_err(|error| format!("StatusLineデータを解析できません: {error}"))
-}
-
-fn run_statusline_capture() {
-    let Ok(input) = read_statusline_input(std::io::stdin().lock()) else {
-        println!("UsageBar");
-        return;
-    };
-    if let Ok(cache) = parse_claude_statusline(&input) {
-        if let Some(path) = claude_status_path()
-            && let Ok(data) = serde_json::to_vec(&cache)
-        {
-            let _ = write_private_atomic(&path, &data);
-        }
-        let remaining = |used: f64| (100.0 - used).round().clamp(0.0, 100.0) as u8;
-        let five = remaining(cache.rate_limits.five_hour.used_percentage);
-        let seven = remaining(cache.rate_limits.seven_day.used_percentage);
-        println!("Claude 5h {five}% · 7d {seven}%");
-    } else {
-        println!("UsageBar");
-    }
-}
-
-fn read_claude_statusline() -> Result<ClaudeUsage, String> {
-    let path = claude_status_path().ok_or("StatusLine保存先を決定できません")?;
-    let data = std::fs::read(&path).map_err(|_| {
-        "StatusLineデータがまだありません（Claude Codeでセッションを開くと取得されます）"
-            .to_string()
-    })?;
-    let cache = parse_claude_statusline(&data)?;
-
-    let window = |window: &ClaudeStatuslineWindow| ClaudeWindow {
-        used_percent: window.used_percentage.round().clamp(0.0, 100.0) as u8,
-        resets_label: if window.resets_at > 0 {
-            format_reset_time(window.resets_at)
-        } else {
-            "不明".to_string()
-        },
-        resets_at: window.resets_at,
-    };
-
-    Ok(ClaudeUsage {
-        five_hour: window(&cache.rate_limits.five_hour),
-        seven_day: window(&cache.rate_limits.seven_day),
-        plan_type: None,
-    })
 }
 
 fn legacy_cache_path() -> Option<PathBuf> {
@@ -1745,6 +1580,46 @@ mod tests {
         assert_eq!(under.remaining_percent(), 100);
     }
 
+    fn window(used_percent: f64, window_duration_mins: u64) -> RateLimitWindow {
+        RateLimitWindow {
+            used_percent,
+            window_duration_mins,
+            resets_at: 0,
+        }
+    }
+
+    #[test]
+    fn window_label_comes_from_the_actual_duration() {
+        assert_eq!(window(0.0, 300).window_label(), "5時間");
+        assert_eq!(window(0.0, 10080).window_label(), "週間");
+        assert_eq!(window(0.0, 1440).window_label(), "1日");
+        assert_eq!(window(0.0, 20160).window_label(), "2週間");
+        assert_eq!(window(0.0, 45).window_label(), "45分");
+        assert_eq!(window(0.0, 0).window_label(), "枠");
+    }
+
+    #[test]
+    fn headline_is_the_shortest_window_regardless_of_position() {
+        // primaryが週間・secondaryが5時間でも、代表値は短い方（5時間）を使う。
+        let limits = RateLimits {
+            primary: Some(window(10.0, 10080)),
+            secondary: Some(window(40.0, 300)),
+            plan_type: None,
+        };
+        assert_eq!(limits.headline().unwrap().remaining_percent(), 60);
+
+        // 週間枠しか返ってこない構成でも、それを代表値として拾う（primary固定だと取りこぼす）。
+        let weekly_only = RateLimits {
+            primary: None,
+            secondary: Some(window(25.0, 10080)),
+            plan_type: None,
+        };
+        assert_eq!(weekly_only.headline().unwrap().remaining_percent(), 75);
+        assert_eq!(weekly_only.windows().count(), 1);
+
+        assert!(RateLimits::default().headline().is_none());
+    }
+
     #[test]
     fn parses_rate_limit_response() {
         let response: RpcResponse = serde_json::from_value(json!({
@@ -1785,12 +1660,23 @@ mod tests {
     }
 
     #[test]
+    fn explains_when_claude_plan_usage_is_unavailable() {
+        let error = claude_usage_error(
+            "Opus 5 · API Usage Billing Session Total cost: $0.0000 Usage: 0 input",
+        );
+        assert!(error.contains("Pro/Maxプラン"));
+        assert!(!error.contains("API Usage Billing"));
+    }
+
+    #[test]
     fn refresh_interval_is_limited_to_usage_safe_choices() {
-        assert_eq!(normalize_refresh_interval(60), 60);
         assert_eq!(normalize_refresh_interval(300), 300);
         assert_eq!(normalize_refresh_interval(600), 600);
-        assert_eq!(normalize_refresh_interval(3600), 3600);
-        assert_eq!(normalize_refresh_interval(120), 300);
+        assert_eq!(normalize_refresh_interval(900), 900);
+        assert_eq!(normalize_refresh_interval(1200), 1200);
+        assert_eq!(normalize_refresh_interval(1800), 1800);
+        assert_eq!(normalize_refresh_interval(60), 300);
+        assert_eq!(normalize_refresh_interval(3600), 1800);
         assert_eq!(normalize_refresh_interval(5), 300);
     }
 
@@ -1798,9 +1684,21 @@ mod tests {
     fn old_settings_receive_default_refresh_interval() {
         let settings: Settings = serde_json::from_str(r#"{"displayMode":"circle"}"#).unwrap();
         assert_eq!(settings.display_mode, DisplayMode::Circle);
-        assert_eq!(settings.refresh_interval_seconds, 60);
+        assert_eq!(settings.refresh_interval_seconds, 300);
         assert_eq!(settings.codex_threshold, 0);
         assert_eq!(settings.claude_threshold, 0);
+    }
+
+    #[test]
+    fn probe_session_id_is_a_uuid() {
+        let session_id = new_probe_session_id();
+        assert_eq!(session_id.len(), 36);
+        assert_eq!(session_id.as_bytes()[8], b'-');
+        assert_eq!(session_id.as_bytes()[13], b'-');
+        assert_eq!(session_id.as_bytes()[18], b'-');
+        assert_eq!(session_id.as_bytes()[23], b'-');
+        assert_eq!(session_id.as_bytes()[14], b'4');
+        assert_eq!(session_id.as_bytes()[19], b'8');
     }
 
     #[test]
@@ -1849,63 +1747,6 @@ mod tests {
     }
 
     #[test]
-    fn statusline_cache_persists_only_required_rate_limit_fields() {
-        let input = br#"{
-            "session_id": "sensitive-session-id",
-            "transcript_path": "/private/transcript.jsonl",
-            "cwd": "/private/project",
-            "rate_limits": {
-                "five_hour": {
-                    "used_percentage": 12.5,
-                    "resets_at": 1781723293,
-                    "extra": "discard me"
-                },
-                "seven_day": {
-                    "used_percentage": 34,
-                    "resets_at": 1782310093
-                },
-                "overage": {"enabled": true}
-            }
-        }"#;
-
-        let cache = parse_claude_statusline(input).unwrap();
-        let persisted: Value =
-            serde_json::from_slice(&serde_json::to_vec(&cache).unwrap()).unwrap();
-        assert_eq!(
-            persisted,
-            json!({
-                "rate_limits": {
-                    "five_hour": {
-                        "used_percentage": 12.5,
-                        "resets_at": 1781723293u64
-                    },
-                    "seven_day": {
-                        "used_percentage": 34.0,
-                        "resets_at": 1782310093u64
-                    }
-                }
-            })
-        );
-        assert!(persisted.get("session_id").is_none());
-        assert!(persisted.get("transcript_path").is_none());
-        assert!(persisted.get("cwd").is_none());
-    }
-
-    #[test]
-    fn statusline_input_is_bounded() {
-        let at_limit = vec![b'x'; MAX_STATUSLINE_INPUT_BYTES as usize];
-        assert_eq!(
-            read_statusline_input(std::io::Cursor::new(&at_limit))
-                .unwrap()
-                .len(),
-            at_limit.len()
-        );
-
-        let over_limit = vec![b'x'; MAX_STATUSLINE_INPUT_BYTES as usize + 1];
-        assert!(read_statusline_input(std::io::Cursor::new(over_limit)).is_err());
-    }
-
-    #[test]
     fn threshold_notifies_once_until_recovery() {
         let mut out = Vec::new();
         let mut notified = false;
@@ -1922,6 +1763,49 @@ mod tests {
 
         check_threshold("Codex", Some(10), 20, &mut notified, &mut out);
         assert_eq!(out.len(), 2, "notifies again after recovery");
+    }
+
+    #[test]
+    fn reset_notifies_once_when_the_window_rolls_over() {
+        let mut out = Vec::new();
+        let mut tracked = None;
+
+        // 初回観測は記録だけ（起動直後に鳴らさない）。
+        check_reset("Claudeの5時間枠", "1:10am", &mut tracked, &mut out);
+        assert!(out.is_empty());
+        assert_eq!(tracked.as_deref(), Some("1:10am"));
+
+        // 同じ枠を見ている間は鳴らない。
+        check_reset("Claudeの5時間枠", "1:10am", &mut tracked, &mut out);
+        assert!(out.is_empty());
+
+        // 新しい枠に変わったら1回だけ鳴る。
+        check_reset("Claudeの5時間枠", "6:10am", &mut tracked, &mut out);
+        assert_eq!(out.len(), 1);
+        assert!(out[0].1.contains("リセットされました"));
+        check_reset("Claudeの5時間枠", "6:10am", &mut tracked, &mut out);
+        assert_eq!(out.len(), 1, "same window must not re-notify");
+    }
+
+    #[test]
+    fn reset_ignores_unparsed_labels() {
+        let mut out = Vec::new();
+        let mut tracked = Some("6:10am".to_string());
+
+        // 解析失敗は判定に使わず、追跡値も巻き戻さない。
+        check_reset(
+            "Claudeの5時間枠",
+            UNKNOWN_RESET_LABEL,
+            &mut tracked,
+            &mut out,
+        );
+        check_reset("Claudeの5時間枠", "", &mut tracked, &mut out);
+        assert!(out.is_empty());
+        assert_eq!(tracked.as_deref(), Some("6:10am"));
+
+        // 解析に戻ったとき、同じ枠なら誤通知しない。
+        check_reset("Claudeの5時間枠", "6:10am", &mut tracked, &mut out);
+        assert!(out.is_empty());
     }
 
     #[test]
