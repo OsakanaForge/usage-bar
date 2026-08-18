@@ -508,10 +508,6 @@ fn check_threshold(
     notified: &mut bool,
     out: &mut Vec<(String, String)>,
 ) {
-    if threshold == 0 {
-        *notified = false;
-        return;
-    }
     let Some(remaining) = remaining else {
         return;
     };
@@ -1863,11 +1859,16 @@ mod tests {
     }
 
     #[test]
-    fn threshold_zero_disables_notifications() {
+    fn threshold_zero_notifies_at_zero_percent() {
         let mut out = Vec::new();
         let mut notified = false;
-        check_threshold("Claude", Some(0), 0, &mut notified, &mut out);
+
+        check_threshold("Claude", Some(1), 0, &mut notified, &mut out);
         assert!(out.is_empty());
         assert!(!notified);
+
+        check_threshold("Claude", Some(0), 0, &mut notified, &mut out);
+        assert_eq!(out.len(), 1);
+        assert!(notified);
     }
 }
