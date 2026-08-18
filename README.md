@@ -31,7 +31,7 @@ xattr -dr com.apple.quarantine /Applications/UsageBar.app
 
 ## 設定
 
-トレイメニューの「設定…」から、メニューバーの表示形式・自動更新間隔・通知のON/OFF・通知しきい値を変更できます。
+トレイメニューの「設定…」から、メニューバーの表示形式・自動更新間隔・通知のON/OFF・通知しきい値を変更できます。変更は操作ごとに自動保存されます。
 設定は `~/Library/Application Support/UsageBar/settings.json` に保存されます。
 直近の取得結果は `~/Library/Application Support/UsageBar/status.json` にキャッシュされます。
 

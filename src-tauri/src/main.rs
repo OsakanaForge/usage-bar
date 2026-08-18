@@ -1293,8 +1293,13 @@ fn set_settings(
     if settings.codex_threshold > 100 || settings.claude_threshold > 100 {
         return Err("しきい値は0〜100%で指定してください".into());
     }
-    {
+    let (service_enabled, notifications) = {
         let mut current = state.lock().expect("monitor state lock poisoned");
+        let service_enabled = (!current.codex_enabled && settings.codex_enabled)
+            || (!current.claude_enabled && settings.claude_enabled);
+        let notification_rules_changed = current.codex_threshold != settings.codex_threshold
+            || current.claude_threshold != settings.claude_threshold
+            || current.remaining_notifications_enabled != settings.remaining_notifications_enabled;
         current.display_mode = settings.display_mode;
         current.refresh_interval_seconds = settings.refresh_interval_seconds;
         if current.codex_threshold != settings.codex_threshold {
@@ -1324,11 +1329,22 @@ fn set_settings(
                 snapshot.claude_usage = None;
             }
         }
-    }
+        let notifications = if notification_rules_changed {
+            remaining_notifications(&mut current)
+        } else {
+            Vec::new()
+        };
+        (service_enabled, notifications)
+    };
     persist_settings(&settings);
+    for (title, body) in notifications {
+        send_notification(&app, &title, &body);
+    }
     update_tray(&app, state.inner());
-    // 有効に戻したサービスをすぐ取得しにいく。
-    refresh(app.clone());
+    // 監視対象を有効に戻した場合は、表示値を復元するためすぐ取得する。
+    if service_enabled {
+        refresh(app.clone());
+    }
     Ok(())
 }
 

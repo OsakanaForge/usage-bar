@@ -198,25 +198,12 @@
       footer {
         display: flex;
         align-items: center;
-        justify-content: space-between;
+        min-height: 30px;
         margin-top: 18px;
       }
 
       #message { color: #6e6e73; }
       #message.error { color: #c42b1c; }
-
-      .save {
-        min-width: 88px;
-        height: 30px;
-        border: 0;
-        border-radius: 7px;
-        color: white;
-        background: #0a84ff;
-        font: inherit;
-        font-weight: 550;
-      }
-
-      .save:disabled { opacity: 0.55; }
 
       @media (prefers-color-scheme: dark) {
         :root { color: #f5f5f7; background: #252525; }
@@ -332,7 +319,6 @@
 
       <footer>
         <span id="message" role="status"></span>
-        <button class="save" id="save" type="button">適用</button>
       </footer>
     </main>
 
@@ -347,12 +333,14 @@
       const remainingNotificationsEnabled = document.querySelector("#remainingNotificationsEnabled");
       const resetNotificationsEnabled = document.querySelector("#resetNotificationsEnabled");
       const launchAtLogin = document.querySelector("#launchAtLogin");
-      const saveButton = document.querySelector("#save");
       const appVersion = document.querySelector("#appVersion");
       const checkUpdateButton = document.querySelector("#checkUpdate");
       const updateFrequency = document.querySelector("#updateFrequency");
       const message = document.querySelector("#message");
       let displayMode = "number";
+      let settingsLoaded = false;
+      let saveQueue = Promise.resolve();
+      let pendingSaveCount = 0;
 
       function clampThreshold(value) {
         return Math.min(100, Math.max(0, Math.round(Number(value) || 0)));
@@ -371,8 +359,55 @@
         claudeThreshold.disabled = !thresholdsEnabled;
       }
 
+      function currentSettings() {
+        return {
+          displayMode,
+          refreshIntervalSeconds: Number(interval.value),
+          codexThreshold: clampThreshold(codexThreshold.value),
+          claudeThreshold: clampThreshold(claudeThreshold.value),
+          remainingNotificationsEnabled: remainingNotificationsEnabled.checked,
+          resetNotificationsEnabled: resetNotificationsEnabled.checked,
+          codexEnabled: codexEnabled.checked,
+          claudeEnabled: claudeEnabled.checked,
+          launchAtLogin: launchAtLogin.checked,
+          updateFrequency: updateFrequency.value,
+        };
+      }
+
+      function queueSettingsSave() {
+        if (!invoke || !settingsLoaded) return;
+
+        const settings = currentSettings();
+        pendingSaveCount += 1;
+        message.textContent = "保存中…";
+        message.classList.remove("error");
+
+        const saveOperation = saveQueue
+          .catch(() => undefined)
+          .then(() => invoke("set_settings", { settings }));
+        saveQueue = saveOperation;
+
+        saveOperation
+          .then(() => {
+            pendingSaveCount -= 1;
+            if (pendingSaveCount === 0) {
+              message.textContent = "保存しました";
+              message.classList.remove("error");
+            }
+          })
+          .catch((error) => {
+            pendingSaveCount -= 1;
+            message.textContent = `保存できませんでした: ${String(error)}`;
+            message.classList.add("error");
+          });
+      }
+
       for (const segment of segments) {
-        segment.addEventListener("click", () => selectMode(segment.dataset.mode));
+        segment.addEventListener("click", () => {
+          if (displayMode === segment.dataset.mode) return;
+          selectMode(segment.dataset.mode);
+          queueSettingsSave();
+        });
       }
 
       async function loadSettings() {
@@ -390,6 +425,7 @@
           syncThresholdAvailability();
           launchAtLogin.checked = settings.launchAtLogin;
           updateFrequency.value = settings.updateFrequency;
+          settingsLoaded = true;
         } catch (error) {
           message.textContent = String(error);
           message.classList.add("error");
@@ -430,36 +466,23 @@
         }
       });
 
-      remainingNotificationsEnabled.addEventListener("change", syncThresholdAvailability);
-
-      saveButton.addEventListener("click", async () => {
-        if (!invoke) return;
-        saveButton.disabled = true;
-        message.textContent = "適用中…";
-        message.classList.remove("error");
-        try {
-          await invoke("set_settings", {
-            settings: {
-              displayMode,
-              refreshIntervalSeconds: Number(interval.value),
-              codexThreshold: clampThreshold(codexThreshold.value),
-              claudeThreshold: clampThreshold(claudeThreshold.value),
-              remainingNotificationsEnabled: remainingNotificationsEnabled.checked,
-              resetNotificationsEnabled: resetNotificationsEnabled.checked,
-              codexEnabled: codexEnabled.checked,
-              claudeEnabled: claudeEnabled.checked,
-              launchAtLogin: launchAtLogin.checked,
-              updateFrequency: updateFrequency.value,
-            },
-          });
-          message.textContent = "適用しました";
-        } catch (error) {
-          message.textContent = String(error);
-          message.classList.add("error");
-        } finally {
-          saveButton.disabled = false;
-        }
+      remainingNotificationsEnabled.addEventListener("change", () => {
+        syncThresholdAvailability();
+        queueSettingsSave();
       });
+
+      for (const control of [
+        interval,
+        codexThreshold,
+        claudeThreshold,
+        codexEnabled,
+        claudeEnabled,
+        resetNotificationsEnabled,
+        launchAtLogin,
+        updateFrequency,
+      ]) {
+        control.addEventListener("change", queueSettingsSave);
+      }
 
       syncThresholdAvailability();
       loadSettings();
