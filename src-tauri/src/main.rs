@@ -136,6 +136,8 @@ struct MonitorState {
     refresh_interval_seconds: u64,
     codex_threshold: u8,
     claude_threshold: u8,
+    remaining_notifications_enabled: bool,
+    reset_notifications_enabled: bool,
     codex_notified: bool,
     claude_notified: bool,
     codex_enabled: bool,
@@ -191,6 +193,8 @@ struct Settings {
     refresh_interval_seconds: u64,
     codex_threshold: u8,
     claude_threshold: u8,
+    remaining_notifications_enabled: bool,
+    reset_notifications_enabled: bool,
     codex_enabled: bool,
     claude_enabled: bool,
     launch_at_login: bool,
@@ -211,6 +215,8 @@ impl Default for Settings {
             refresh_interval_seconds: 5 * 60,
             codex_threshold: 0,
             claude_threshold: 0,
+            remaining_notifications_enabled: true,
+            reset_notifications_enabled: true,
             codex_enabled: true,
             claude_enabled: true,
             launch_at_login: true,
@@ -278,6 +284,8 @@ fn main() {
                 refresh_interval_seconds: settings.refresh_interval_seconds,
                 codex_threshold: settings.codex_threshold,
                 claude_threshold: settings.claude_threshold,
+                remaining_notifications_enabled: settings.remaining_notifications_enabled,
+                reset_notifications_enabled: settings.reset_notifications_enabled,
                 codex_enabled: settings.codex_enabled,
                 claude_enabled: settings.claude_enabled,
                 update_frequency: settings.update_frequency,
@@ -381,7 +389,7 @@ fn refresh(app: AppHandle) {
                     save_cache(&snapshot);
                     current.latest = Some(snapshot);
                     current.last_error = warning;
-                    let mut notifications = pending_notifications(&mut current);
+                    let mut notifications = remaining_notifications(&mut current);
                     notifications.extend(reset_notifications(&mut current));
                     notifications
                 }
@@ -416,12 +424,14 @@ fn reset_notifications(state: &mut MonitorState) -> Vec<(String, String)> {
     check_reset(
         "Claudeの5時間枠",
         &five,
+        state.reset_notifications_enabled,
         &mut state.five_hour_reset_label,
         &mut out,
     );
     check_reset(
         "Claudeの週間枠",
         &seven,
+        state.reset_notifications_enabled,
         &mut state.seven_day_reset_label,
         &mut out,
     );
@@ -431,6 +441,7 @@ fn reset_notifications(state: &mut MonitorState) -> Vec<(String, String)> {
 fn check_reset(
     name: &str,
     label: &str,
+    notifications_enabled: bool,
     tracked: &mut Option<String>,
     out: &mut Vec<(String, String)>,
 ) {
@@ -443,16 +454,23 @@ fn check_reset(
         None => *tracked = Some(label.to_string()),
         Some(previous) if previous != label => {
             *tracked = Some(label.to_string());
-            out.push((
-                "UsageBar".to_string(),
-                format!("{name}がリセットされました（利用可能になりました）"),
-            ));
+            if notifications_enabled {
+                out.push((
+                    "UsageBar".to_string(),
+                    format!("{name}がリセットされました（利用可能になりました）"),
+                ));
+            }
         }
         Some(_) => {}
     }
 }
 
-fn pending_notifications(state: &mut MonitorState) -> Vec<(String, String)> {
+fn remaining_notifications(state: &mut MonitorState) -> Vec<(String, String)> {
+    if !state.remaining_notifications_enabled {
+        state.codex_notified = false;
+        state.claude_notified = false;
+        return Vec::new();
+    }
     let Some(snapshot) = state.latest.as_ref() else {
         return Vec::new();
     };
@@ -490,10 +508,6 @@ fn check_threshold(
     notified: &mut bool,
     out: &mut Vec<(String, String)>,
 ) {
-    if threshold == 0 {
-        *notified = false;
-        return;
-    }
     let Some(remaining) = remaining else {
         return;
     };
@@ -1217,7 +1231,7 @@ fn show_settings_window(app: &AppHandle) {
     }
     let _ = WebviewWindowBuilder::new(app, "settings", WebviewUrl::App("index.html".into()))
         .title("UsageBar設定")
-        .inner_size(470.0, 660.0)
+        .inner_size(470.0, 720.0)
         .resizable(false)
         .center()
         .build();
@@ -1258,6 +1272,8 @@ fn get_settings(app: AppHandle, state: tauri::State<'_, SharedState>) -> Setting
         refresh_interval_seconds: current.refresh_interval_seconds,
         codex_threshold: current.codex_threshold,
         claude_threshold: current.claude_threshold,
+        remaining_notifications_enabled: current.remaining_notifications_enabled,
+        reset_notifications_enabled: current.reset_notifications_enabled,
         codex_enabled: current.codex_enabled,
         claude_enabled: current.claude_enabled,
         launch_at_login: launch_at_login_enabled(&app),
@@ -1277,8 +1293,13 @@ fn set_settings(
     if settings.codex_threshold > 100 || settings.claude_threshold > 100 {
         return Err("しきい値は0〜100%で指定してください".into());
     }
-    {
+    let (service_enabled, notifications) = {
         let mut current = state.lock().expect("monitor state lock poisoned");
+        let service_enabled = (!current.codex_enabled && settings.codex_enabled)
+            || (!current.claude_enabled && settings.claude_enabled);
+        let notification_rules_changed = current.codex_threshold != settings.codex_threshold
+            || current.claude_threshold != settings.claude_threshold
+            || current.remaining_notifications_enabled != settings.remaining_notifications_enabled;
         current.display_mode = settings.display_mode;
         current.refresh_interval_seconds = settings.refresh_interval_seconds;
         if current.codex_threshold != settings.codex_threshold {
@@ -1289,6 +1310,12 @@ fn set_settings(
             current.claude_threshold = settings.claude_threshold;
             current.claude_notified = false;
         }
+        if current.remaining_notifications_enabled != settings.remaining_notifications_enabled {
+            current.codex_notified = false;
+            current.claude_notified = false;
+        }
+        current.remaining_notifications_enabled = settings.remaining_notifications_enabled;
+        current.reset_notifications_enabled = settings.reset_notifications_enabled;
         current.codex_enabled = settings.codex_enabled;
         current.claude_enabled = settings.claude_enabled;
         current.update_frequency = settings.update_frequency;
@@ -1302,11 +1329,22 @@ fn set_settings(
                 snapshot.claude_usage = None;
             }
         }
-    }
+        let notifications = if notification_rules_changed {
+            remaining_notifications(&mut current)
+        } else {
+            Vec::new()
+        };
+        (service_enabled, notifications)
+    };
     persist_settings(&settings);
+    for (title, body) in notifications {
+        send_notification(&app, &title, &body);
+    }
     update_tray(&app, state.inner());
-    // 有効に戻したサービスをすぐ取得しにいく。
-    refresh(app.clone());
+    // 監視対象を有効に戻した場合は、表示値を復元するためすぐ取得する。
+    if service_enabled {
+        refresh(app.clone());
+    }
     Ok(())
 }
 
@@ -1687,6 +1725,8 @@ mod tests {
         assert_eq!(settings.refresh_interval_seconds, 300);
         assert_eq!(settings.codex_threshold, 0);
         assert_eq!(settings.claude_threshold, 0);
+        assert!(settings.remaining_notifications_enabled);
+        assert!(settings.reset_notifications_enabled);
     }
 
     #[test]
@@ -1771,19 +1811,19 @@ mod tests {
         let mut tracked = None;
 
         // 初回観測は記録だけ（起動直後に鳴らさない）。
-        check_reset("Claudeの5時間枠", "1:10am", &mut tracked, &mut out);
+        check_reset("Claudeの5時間枠", "1:10am", true, &mut tracked, &mut out);
         assert!(out.is_empty());
         assert_eq!(tracked.as_deref(), Some("1:10am"));
 
         // 同じ枠を見ている間は鳴らない。
-        check_reset("Claudeの5時間枠", "1:10am", &mut tracked, &mut out);
+        check_reset("Claudeの5時間枠", "1:10am", true, &mut tracked, &mut out);
         assert!(out.is_empty());
 
         // 新しい枠に変わったら1回だけ鳴る。
-        check_reset("Claudeの5時間枠", "6:10am", &mut tracked, &mut out);
+        check_reset("Claudeの5時間枠", "6:10am", true, &mut tracked, &mut out);
         assert_eq!(out.len(), 1);
         assert!(out[0].1.contains("リセットされました"));
-        check_reset("Claudeの5時間枠", "6:10am", &mut tracked, &mut out);
+        check_reset("Claudeの5時間枠", "6:10am", true, &mut tracked, &mut out);
         assert_eq!(out.len(), 1, "same window must not re-notify");
     }
 
@@ -1796,24 +1836,55 @@ mod tests {
         check_reset(
             "Claudeの5時間枠",
             UNKNOWN_RESET_LABEL,
+            true,
             &mut tracked,
             &mut out,
         );
-        check_reset("Claudeの5時間枠", "", &mut tracked, &mut out);
+        check_reset("Claudeの5時間枠", "", true, &mut tracked, &mut out);
         assert!(out.is_empty());
         assert_eq!(tracked.as_deref(), Some("6:10am"));
 
         // 解析に戻ったとき、同じ枠なら誤通知しない。
-        check_reset("Claudeの5時間枠", "6:10am", &mut tracked, &mut out);
+        check_reset("Claudeの5時間枠", "6:10am", true, &mut tracked, &mut out);
         assert!(out.is_empty());
     }
 
     #[test]
-    fn threshold_zero_disables_notifications() {
+    fn disabled_reset_notifications_still_track_the_current_window() {
+        let mut out = Vec::new();
+        let mut tracked = Some("1:10am".to_string());
+
+        check_reset("Claudeの5時間枠", "6:10am", false, &mut tracked, &mut out);
+
+        assert!(out.is_empty());
+        assert_eq!(tracked.as_deref(), Some("6:10am"));
+    }
+
+    #[test]
+    fn disabled_remaining_notifications_clear_notification_state() {
+        let mut state = MonitorState {
+            remaining_notifications_enabled: false,
+            codex_notified: true,
+            claude_notified: true,
+            ..MonitorState::default()
+        };
+
+        assert!(remaining_notifications(&mut state).is_empty());
+        assert!(!state.codex_notified);
+        assert!(!state.claude_notified);
+    }
+
+    #[test]
+    fn threshold_zero_notifies_at_zero_percent() {
         let mut out = Vec::new();
         let mut notified = false;
-        check_threshold("Claude", Some(0), 0, &mut notified, &mut out);
+
+        check_threshold("Claude", Some(1), 0, &mut notified, &mut out);
         assert!(out.is_empty());
         assert!(!notified);
+
+        check_threshold("Claude", Some(0), 0, &mut notified, &mut out);
+        assert_eq!(out.len(), 1);
+        assert!(notified);
     }
 }
