@@ -8,7 +8,7 @@ Dockには表示されない常駐型（メニューバー）アプリです。
 
 - メニューバーに残量を表示（`Codex 94% · Claude 96%` の数字表示、またはサービスごとの円形ゲージ表示を切替可能）。表示するのは**いちばん短い枠**（通常は5時間枠。Codexが週間枠しか返さないときは週間枠）
 - クリックで各枠の残量、リセット時刻、プラン、取得状態を確認。枠の名前（`5時間` / `週間`）はCodexが返す枠の長さから決まる
-- 残量がしきい値以下になったときのmacOS通知（Codex・Claudeごとに個別設定、0で無効）
+- 残量がしきい値以下になったときのmacOS通知（Codex・Claudeごとに個別設定、0で無効）と、Claudeの枠がリセットされたときの通知。それぞれON/OFF可能
 - 自動更新間隔の設定（5分・10分・15分・20分・30分）
 - 手動更新
 - GitHub Releasesからの署名検証付き自動更新
@@ -31,7 +31,7 @@ xattr -dr com.apple.quarantine /Applications/UsageBar.app
 
 ## 設定
 
-トレイメニューの「設定…」から、メニューバーの表示形式・自動更新間隔・通知しきい値を変更できます。
+トレイメニューの「設定…」から、メニューバーの表示形式・自動更新間隔・通知のON/OFF・通知しきい値を変更できます。
 設定は `~/Library/Application Support/UsageBar/settings.json` に保存されます。
 直近の取得結果は `~/Library/Application Support/UsageBar/status.json` にキャッシュされます。
 

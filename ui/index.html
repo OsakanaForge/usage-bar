@@ -244,7 +244,7 @@
   <body>
     <main>
       <h1>一般</h1>
-      <p class="subtitle">メニューバーの表示と使用量の更新頻度を設定します。</p>
+      <p class="subtitle">メニューバーの表示、使用量の更新頻度、通知を設定します。</p>
 
       <section class="panel" aria-label="一般設定">
         <div class="row">
@@ -287,6 +287,19 @@
           </select>
         </label>
         <div class="row">
+          <span class="label">通知</span>
+          <div class="toggles">
+            <label class="toggle">
+              <input id="remainingNotificationsEnabled" type="checkbox" />
+              <span>残量</span>
+            </label>
+            <label class="toggle">
+              <input id="resetNotificationsEnabled" type="checkbox" />
+              <span>リセット</span>
+            </label>
+          </div>
+        </div>
+        <div class="row">
           <span class="label">通知しきい値</span>
           <div class="thresholds">
             <label class="threshold">
@@ -317,7 +330,7 @@
         </div>
       </section>
 
-      <p class="hint">残量がしきい値以下になると通知します。0で通知オフ。</p>
+      <p class="hint">残量通知はしきい値以下で通知します（0でサービスごとにオフ）。リセット通知はClaudeの枠が更新されたときに通知します。</p>
 
       <div class="source-note">
         <span class="status-dot" aria-hidden="true"></span>
@@ -338,6 +351,8 @@
       const claudeThreshold = document.querySelector("#claudeThreshold");
       const codexEnabled = document.querySelector("#codexEnabled");
       const claudeEnabled = document.querySelector("#claudeEnabled");
+      const remainingNotificationsEnabled = document.querySelector("#remainingNotificationsEnabled");
+      const resetNotificationsEnabled = document.querySelector("#resetNotificationsEnabled");
       const launchAtLogin = document.querySelector("#launchAtLogin");
       const saveButton = document.querySelector("#save");
       const appVersion = document.querySelector("#appVersion");
@@ -371,6 +386,8 @@
           claudeThreshold.value = String(settings.claudeThreshold);
           codexEnabled.checked = settings.codexEnabled;
           claudeEnabled.checked = settings.claudeEnabled;
+          remainingNotificationsEnabled.checked = settings.remainingNotificationsEnabled;
+          resetNotificationsEnabled.checked = settings.resetNotificationsEnabled;
           launchAtLogin.checked = settings.launchAtLogin;
           updateFrequency.value = settings.updateFrequency;
         } catch (error) {
@@ -425,6 +442,8 @@
               refreshIntervalSeconds: Number(interval.value),
               codexThreshold: clampThreshold(codexThreshold.value),
               claudeThreshold: clampThreshold(claudeThreshold.value),
+              remainingNotificationsEnabled: remainingNotificationsEnabled.checked,
+              resetNotificationsEnabled: resetNotificationsEnabled.checked,
               codexEnabled: codexEnabled.checked,
               claudeEnabled: claudeEnabled.checked,
               launchAtLogin: launchAtLogin.checked,
