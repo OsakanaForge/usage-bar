@@ -154,13 +154,6 @@
         gap: 8px;
       }
 
-      .update-frequency {
-        width: auto;
-        min-width: 72px;
-        height: 30px;
-        padding: 0 24px 0 8px;
-      }
-
       .update-button {
         min-width: 104px;
         height: 30px;
@@ -301,11 +294,6 @@
           <div class="update-info">
             <span class="version" id="appVersion">確認中…</span>
             <div class="update-actions">
-              <select id="updateFrequency" class="update-frequency">
-                <option value="daily">毎日</option>
-                <option value="weekly">毎週</option>
-                <option value="monthly">毎月</option>
-              </select>
               <button class="update-button" id="checkUpdate" type="button">今すぐ確認</button>
             </div>
           </div>
@@ -335,7 +323,6 @@
       const launchAtLogin = document.querySelector("#launchAtLogin");
       const appVersion = document.querySelector("#appVersion");
       const checkUpdateButton = document.querySelector("#checkUpdate");
-      const updateFrequency = document.querySelector("#updateFrequency");
       const message = document.querySelector("#message");
       let displayMode = "number";
       let settingsLoaded = false;
@@ -370,7 +357,6 @@
           codexEnabled: codexEnabled.checked,
           claudeEnabled: claudeEnabled.checked,
           launchAtLogin: launchAtLogin.checked,
-          updateFrequency: updateFrequency.value,
         };
       }
 
@@ -424,7 +410,6 @@
           resetNotificationsEnabled.checked = settings.resetNotificationsEnabled;
           syncThresholdAvailability();
           launchAtLogin.checked = settings.launchAtLogin;
-          updateFrequency.value = settings.updateFrequency;
           settingsLoaded = true;
         } catch (error) {
           message.textContent = String(error);
@@ -479,7 +464,6 @@
         claudeEnabled,
         resetNotificationsEnabled,
         launchAtLogin,
-        updateFrequency,
       ]) {
         control.addEventListener("change", queueSettingsSave);
       }

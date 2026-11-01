@@ -142,7 +142,6 @@ struct MonitorState {
     claude_notified: bool,
     codex_enabled: bool,
     claude_enabled: bool,
-    update_frequency: UpdateFrequency,
     five_hour_reset_label: Option<String>,
     seven_day_reset_label: Option<String>,
 }
@@ -155,25 +154,6 @@ enum DisplayMode {
     #[default]
     Number,
     Circle,
-}
-
-#[derive(Clone, Copy, Debug, Default, Deserialize, PartialEq, Serialize)]
-#[serde(rename_all = "camelCase")]
-enum UpdateFrequency {
-    #[default]
-    Daily,
-    Weekly,
-    Monthly,
-}
-
-impl UpdateFrequency {
-    fn seconds(self) -> u64 {
-        match self {
-            UpdateFrequency::Daily => 24 * 60 * 60,
-            UpdateFrequency::Weekly => 7 * 24 * 60 * 60,
-            UpdateFrequency::Monthly => 30 * 24 * 60 * 60,
-        }
-    }
 }
 
 const ALLOWED_REFRESH_INTERVALS: [u64; 5] = [5 * 60, 10 * 60, 15 * 60, 20 * 60, 30 * 60];
@@ -198,7 +178,6 @@ struct Settings {
     codex_enabled: bool,
     claude_enabled: bool,
     launch_at_login: bool,
-    update_frequency: UpdateFrequency,
 }
 
 #[derive(Serialize)]
@@ -220,7 +199,6 @@ impl Default for Settings {
             codex_enabled: true,
             claude_enabled: true,
             launch_at_login: true,
-            update_frequency: UpdateFrequency::Daily,
         }
     }
 }
@@ -288,7 +266,6 @@ fn main() {
                 reset_notifications_enabled: settings.reset_notifications_enabled,
                 codex_enabled: settings.codex_enabled,
                 claude_enabled: settings.claude_enabled,
-                update_frequency: settings.update_frequency,
                 ..MonitorState::default()
             }));
             app.manage(state.clone());
@@ -321,30 +298,15 @@ fn main() {
         .expect("failed to run UsageBar");
 }
 
-/// 常駐中に「設定の確認頻度を過ぎたか」を判定する間隔。
-/// 判定は時刻の比較だけで、実際の更新確認は頻度を過ぎたときにしか行わない。
-const UPDATE_CHECK_POLL_SECONDS: u64 = 60 * 60;
+/// 自動更新チェックの間隔。確認は latest.json（約1KB）の取得だけで、新しい版があるときだけダウンロードする。
+const UPDATE_CHECK_INTERVAL_SECONDS: u64 = 60 * 60;
 
-fn update_check_due(now: u64, last_checked: u64, frequency: UpdateFrequency) -> bool {
-    // 時計の巻き戻りで前回時刻が未来になった場合も、確認が止まり続けないよう対象にする。
-    last_checked > now || now - last_checked >= frequency.seconds()
-}
-
-/// 起動直後と、その後は常駐中に1時間ごと、確認頻度に達していれば自動更新チェックを実行。
+/// 起動直後と、その後は常駐中に1時間ごとに自動更新チェックを実行。
 fn start_periodic_update_check(app: AppHandle) {
     std::thread::spawn(move || {
         loop {
-            let frequency = app
-                .state::<SharedState>()
-                .lock()
-                .expect("monitor state lock poisoned")
-                .update_frequency;
-            let now = now_epoch();
-            if update_check_due(now, read_last_update_check(), frequency) {
-                write_last_update_check(now);
-                check_for_update(app.clone());
-            }
-            std::thread::sleep(Duration::from_secs(UPDATE_CHECK_POLL_SECONDS));
+            check_for_update(app.clone());
+            std::thread::sleep(Duration::from_secs(UPDATE_CHECK_INTERVAL_SECONDS));
         }
     });
 }
@@ -1087,11 +1049,11 @@ fn update_tray(app: &AppHandle, state: &SharedState) {
         }
         DisplayMode::Circle => {
             let _ = tray.set_title(Some(""));
-            let percentages = [codex_remaining, claude_remaining]
+            let entries = [("Codex", codex_remaining), ("Claude", claude_remaining)]
                 .into_iter()
-                .flatten()
+                .filter_map(|(label, remaining)| remaining.map(|remaining| (label, remaining)))
                 .collect::<Vec<_>>();
-            let _ = tray.set_icon(Some(circle_icon(&percentages)));
+            let _ = tray.set_icon(Some(circle_icon(&entries)));
             let _ = tray.set_icon_as_template(true);
         }
     }
@@ -1299,7 +1261,6 @@ fn get_settings(app: AppHandle, state: tauri::State<'_, SharedState>) -> Setting
         codex_enabled: current.codex_enabled,
         claude_enabled: current.claude_enabled,
         launch_at_login: launch_at_login_enabled(&app),
-        update_frequency: current.update_frequency,
     }
 }
 
@@ -1340,7 +1301,6 @@ fn set_settings(
         current.reset_notifications_enabled = settings.reset_notifications_enabled;
         current.codex_enabled = settings.codex_enabled;
         current.claude_enabled = settings.claude_enabled;
-        current.update_frequency = settings.update_frequency;
         apply_launch_at_login(&app, settings.launch_at_login);
         // 無効化されたサービスの表示値は即座にクリアする。
         if let Some(snapshot) = current.latest.as_mut() {
@@ -1370,48 +1330,223 @@ fn set_settings(
     Ok(())
 }
 
-fn circle_icon(remaining_percentages: &[u8]) -> Image<'static> {
-    const SIZE: u32 = 32;
-    const SAMPLES: u32 = 4;
-    let count = remaining_percentages.len().max(1) as u32;
-    let width = SIZE * count;
-    let mut rgba = vec![0; (width * SIZE * 4) as usize];
+/// 円表示アイコンの高さ（px）。メニューバーのアイコンは高さ18ptで表示されるため、Retina用に2倍で描く。
+const CIRCLE_ICON_HEIGHT: u32 = 36;
+const CIRCLE_ICON_SCALE: f64 = 2.0;
+/// ラベル文字と円の間隔（px）。円の描画枠にも左右4pxの余白がある。
+const CIRCLE_LABEL_GAP: f64 = 2.0;
 
-    for (ring, remaining_percent) in remaining_percentages
-        .iter()
-        .copied()
-        .chain((remaining_percentages.is_empty()).then_some(0))
-        .enumerate()
-    {
-        let center_x = ring as f64 * f64::from(SIZE) + 16.0;
-        let progress = f64::from(remaining_percent.clamp(0, 100)) / 100.0;
-        for y in 0..SIZE {
-            for x in ring as u32 * SIZE..(ring as u32 + 1) * SIZE {
-                let mut alpha = 0u32;
-                for sample_y in 0..SAMPLES {
-                    for sample_x in 0..SAMPLES {
-                        let px = f64::from(x) + (f64::from(sample_x) + 0.5) / f64::from(SAMPLES);
-                        let py = f64::from(y) + (f64::from(sample_y) + 0.5) / f64::from(SAMPLES);
-                        let dx = px - center_x;
-                        let dy = py - 16.0;
-                        let distance = (dx * dx + dy * dy).sqrt();
-                        if (10.0..=14.0).contains(&distance) {
-                            let angle = dx.atan2(-dy).rem_euclid(std::f64::consts::TAU);
-                            alpha += if angle <= progress * std::f64::consts::TAU {
-                                255
-                            } else {
-                                55
-                            };
-                        }
+/// 数字表示の「Codex 85% · Claude 60%」と同じ並びで、数字の代わりに残量の円を描く。
+/// 文字と円を交互に並べるため、文字も含めて1枚のテンプレート画像にする。
+fn circle_icon(entries: &[(&str, u8)]) -> Image<'static> {
+    let height = CIRCLE_ICON_HEIGHT;
+    let font = tray_text::menu_bar_font(CIRCLE_ICON_SCALE);
+
+    let mut labels = Vec::new();
+    let mut rings = Vec::new();
+    let mut x = 0.0;
+    for (index, (label, remaining)) in entries.iter().enumerate() {
+        let text = if index == 0 {
+            (*label).to_string()
+        } else {
+            format!(" · {label}")
+        };
+        if let Some(line) = font.as_ref().and_then(|font| font.line(&text)) {
+            let width = line.width();
+            labels.push((x, line));
+            x += width + CIRCLE_LABEL_GAP;
+        }
+        rings.push((x.round() as u32, *remaining));
+        x = x.round() + f64::from(height);
+    }
+    if rings.is_empty() {
+        rings.push((0, 0));
+        x = f64::from(height);
+    }
+
+    let width = x.ceil() as u32;
+    let mut alpha = vec![0u8; (width * height) as usize];
+    if let Some(font) = font.as_ref() {
+        font.draw(&mut alpha, width, height, &labels);
+    }
+    for (origin_x, remaining) in rings {
+        draw_ring(&mut alpha, width, origin_x, remaining);
+    }
+
+    let rgba = alpha.into_iter().flat_map(|a| [0, 0, 0, a]).collect();
+    Image::new_owned(rgba, width, height)
+}
+
+/// 左端が `origin_x` の正方形の枠に、残量の割合だけ濃い円を描く。
+fn draw_ring(alpha: &mut [u8], width: u32, origin_x: u32, remaining_percent: u8) {
+    const SAMPLES: u32 = 4;
+    const INNER_RADIUS: f64 = 10.0;
+    const OUTER_RADIUS: f64 = 14.0;
+    let size = CIRCLE_ICON_HEIGHT;
+    let center_x = f64::from(origin_x) + f64::from(size) / 2.0;
+    let center_y = f64::from(size) / 2.0;
+    let progress = f64::from(remaining_percent.clamp(0, 100)) / 100.0;
+
+    for y in 0..size {
+        for x in origin_x..(origin_x + size).min(width) {
+            let mut coverage = 0u32;
+            for sample_y in 0..SAMPLES {
+                for sample_x in 0..SAMPLES {
+                    let px = f64::from(x) + (f64::from(sample_x) + 0.5) / f64::from(SAMPLES);
+                    let py = f64::from(y) + (f64::from(sample_y) + 0.5) / f64::from(SAMPLES);
+                    let dx = px - center_x;
+                    let dy = py - center_y;
+                    let distance = (dx * dx + dy * dy).sqrt();
+                    if (INNER_RADIUS..=OUTER_RADIUS).contains(&distance) {
+                        let angle = dx.atan2(-dy).rem_euclid(std::f64::consts::TAU);
+                        coverage += if angle <= progress * std::f64::consts::TAU {
+                            255
+                        } else {
+                            55
+                        };
                     }
                 }
-                let index = ((y * width + x) * 4 + 3) as usize;
-                rgba[index] = (alpha / (SAMPLES * SAMPLES)) as u8;
             }
+            let index = (y * width + x) as usize;
+            alpha[index] = alpha[index].max((coverage / (SAMPLES * SAMPLES)) as u8);
+        }
+    }
+}
+
+/// メニューバーと同じシステムフォントで、ラベル文字をアルファのみのビットマップへ描く。
+#[cfg(target_os = "macos")]
+mod tray_text {
+    use objc2_core_foundation::{
+        CFAttributedString, CFBoolean, CFDictionary, CFRetained, CFString, CFType,
+    };
+    use objc2_core_graphics::{CGBitmapContextCreate, CGContext, CGImageAlphaInfo};
+    use objc2_core_text::{
+        CTFont, CTFontUIFontType, CTLine, kCTFontAttributeName,
+        kCTForegroundColorFromContextAttributeName,
+    };
+
+    pub struct MenuBarFont {
+        font: CFRetained<CTFont>,
+    }
+
+    pub struct TextLine {
+        line: CFRetained<CTLine>,
+        width: f64,
+    }
+
+    impl TextLine {
+        pub fn width(&self) -> f64 {
+            self.width
         }
     }
 
-    Image::new_owned(rgba, width, SIZE)
+    pub fn menu_bar_font(scale: f64) -> Option<MenuBarFont> {
+        // SAFETY: 引数はすべて有効な値で、言語指定なし（None）はシステム既定を意味する。
+        let font = unsafe {
+            let default_size =
+                CTFont::new_ui_font_for_language(CTFontUIFontType::MenuTitle, 0.0, None)?.size();
+            CTFont::new_ui_font_for_language(
+                CTFontUIFontType::MenuTitle,
+                default_size * scale,
+                None,
+            )?
+        };
+        Some(MenuBarFont { font })
+    }
+
+    impl MenuBarFont {
+        pub fn line(&self, text: &str) -> Option<TextLine> {
+            let string = CFString::from_str(text);
+            // SAFETY: CoreTextが提供する属性キーの定数を読むだけ。
+            let keys: [&CFString; 2] = unsafe {
+                [
+                    kCTFontAttributeName,
+                    kCTForegroundColorFromContextAttributeName,
+                ]
+            };
+            let font: &CFType = (*self.font).as_ref();
+            let values: [&CFType; 2] = [font, CFBoolean::new(true).as_ref()];
+            let attributes = CFDictionary::<CFString, CFType>::from_slices(&keys, &values);
+            // SAFETY: 文字列と属性辞書は有効なCFオブジェクトで、属性値の型はキーの仕様どおり。
+            let line = unsafe {
+                let attributed =
+                    CFAttributedString::new(None, Some(&string), Some(attributes.as_opaque()))?;
+                CTLine::with_attributed_string(&attributed)
+            };
+            // SAFETY: 不要な出力引数にはnullを渡せる。
+            let width = unsafe {
+                line.typographic_bounds(
+                    std::ptr::null_mut(),
+                    std::ptr::null_mut(),
+                    std::ptr::null_mut(),
+                )
+            };
+            Some(TextLine { line, width })
+        }
+
+        /// 各行を (左端のx, 行) の位置に、大文字の高さが縦中央になるよう描く。
+        pub fn draw(&self, alpha: &mut [u8], width: u32, height: u32, lines: &[(f64, TextLine)]) {
+            if lines.is_empty() || alpha.len() < (width * height) as usize {
+                return;
+            }
+            // SAFETY: `alpha` は width×height バイト以上あり、コンテキストはこの関数内で破棄されるため、
+            // バッファより長く生存しない。アルファのみの形式では色空間は不要（None）。
+            let Some(context) = (unsafe {
+                CGBitmapContextCreate(
+                    alpha.as_mut_ptr().cast(),
+                    width as usize,
+                    height as usize,
+                    8,
+                    width as usize,
+                    None,
+                    CGImageAlphaInfo::Only.0,
+                )
+            }) else {
+                return;
+            };
+            CGContext::set_gray_fill_color(Some(&context), 0.0, 1.0);
+            // SAFETY: フォントは有効なCTFont。
+            let cap_height = unsafe { self.font.cap_height() };
+            let baseline = ((f64::from(height) - cap_height) / 2.0).round();
+            for (x, line) in lines {
+                CGContext::set_text_position(Some(&context), *x, baseline);
+                // SAFETY: 行とコンテキストはどちらも有効で、描画先バッファは生存している。
+                unsafe { line.line.draw(&context) };
+            }
+        }
+    }
+}
+
+/// macOS以外ではラベル文字を描かず、円だけを並べる。
+#[cfg(not(target_os = "macos"))]
+mod tray_text {
+    pub struct MenuBarFont;
+    pub struct TextLine;
+
+    impl TextLine {
+        pub fn width(&self) -> f64 {
+            0.0
+        }
+    }
+
+    pub fn menu_bar_font(_scale: f64) -> Option<MenuBarFont> {
+        None
+    }
+
+    impl MenuBarFont {
+        pub fn line(&self, _text: &str) -> Option<TextLine> {
+            None
+        }
+
+        pub fn draw(
+            &self,
+            _alpha: &mut [u8],
+            _width: u32,
+            _height: u32,
+            _lines: &[(f64, TextLine)],
+        ) {
+        }
+    }
 }
 
 fn format_reset_time(timestamp: u64) -> String {
@@ -1476,29 +1611,6 @@ fn write_private_atomic(path: &Path, data: &[u8]) -> std::io::Result<()> {
         let _ = std::fs::remove_file(&temporary);
     }
     result
-}
-
-fn last_update_check_path() -> Option<PathBuf> {
-    env::var_os("HOME").map(|home| {
-        PathBuf::from(home).join("Library/Application Support/UsageBar/last-update-check")
-    })
-}
-
-fn read_last_update_check() -> u64 {
-    last_update_check_path()
-        .and_then(|path| std::fs::read_to_string(path).ok())
-        .and_then(|text| text.trim().parse::<u64>().ok())
-        .unwrap_or(0)
-}
-
-fn write_last_update_check(timestamp: u64) {
-    let Some(path) = last_update_check_path() else {
-        return;
-    };
-    if let Some(directory) = path.parent() {
-        let _ = std::fs::create_dir_all(directory);
-    }
-    let _ = std::fs::write(path, timestamp.to_string());
 }
 
 /// 任意のUTF-8文字列をPOSIX shellの単一引数として安全に引用する。
@@ -1699,12 +1811,48 @@ mod tests {
         assert_eq!(limits.plan_type.as_deref(), Some("plus"));
     }
 
+    fn alpha_at(icon: &Image<'_>, x: u32, y: u32) -> u8 {
+        icon.rgba()[((y * icon.width() + x) * 4 + 3) as usize]
+    }
+
     #[test]
-    fn circle_icon_has_expected_dimensions() {
-        let icon = circle_icon(&[50, 75]);
-        assert_eq!(icon.width(), 64);
-        assert_eq!(icon.height(), 32);
-        assert_eq!(icon.rgba().len(), 64 * 32 * 4);
+    fn circle_icon_without_services_is_a_single_empty_ring() {
+        let icon = circle_icon(&[]);
+        assert_eq!(icon.width(), CIRCLE_ICON_HEIGHT);
+        assert_eq!(icon.height(), CIRCLE_ICON_HEIGHT);
+        assert_eq!(
+            icon.rgba().len(),
+            (icon.width() * icon.height() * 4) as usize
+        );
+    }
+
+    #[test]
+    fn circle_icon_places_each_label_before_its_ring() {
+        let rings_only = 2 * CIRCLE_ICON_HEIGHT;
+        let icon = circle_icon(&[("Codex", 50), ("Claude", 75)]);
+        assert_eq!(icon.height(), CIRCLE_ICON_HEIGHT);
+        assert_eq!(
+            icon.rgba().len(),
+            (icon.width() * icon.height() * 4) as usize
+        );
+        assert!(
+            icon.width() > rings_only,
+            "labels must add width: {} <= {rings_only}",
+            icon.width()
+        );
+
+        // 先頭は「Codex」の文字。円より左の領域にも描画があること。
+        let label_has_ink = (0..icon.width() - rings_only)
+            .any(|x| (0..icon.height()).any(|y| alpha_at(&icon, x, y) > 0));
+        assert!(label_has_ink, "label text must be drawn");
+
+        // 末尾は「Claude」の円。円の中心は透明で、円周には描画があること。
+        let center_x = icon.width() - CIRCLE_ICON_HEIGHT / 2;
+        let center_y = CIRCLE_ICON_HEIGHT / 2;
+        assert_eq!(alpha_at(&icon, center_x, center_y), 0);
+        let ring_has_ink = (0..CIRCLE_ICON_HEIGHT / 2)
+            .any(|offset| alpha_at(&icon, center_x, center_y - offset) > 0);
+        assert!(ring_has_ink, "ring must be drawn");
     }
 
     #[test]
@@ -1911,47 +2059,28 @@ mod tests {
     }
 
     #[test]
-    fn update_check_is_due_once_the_selected_frequency_has_elapsed() {
-        const DAY: u64 = 24 * 60 * 60;
-        let now = 100 * DAY;
-
-        // 一度も確認していなければ、すぐに確認する。
-        assert!(update_check_due(now, 0, UpdateFrequency::Daily));
-
-        assert!(!update_check_due(
-            now,
-            now - DAY + 1,
-            UpdateFrequency::Daily
-        ));
-        assert!(update_check_due(now, now - DAY, UpdateFrequency::Daily));
-
-        assert!(!update_check_due(
-            now,
-            now - 6 * DAY,
-            UpdateFrequency::Weekly
-        ));
-        assert!(update_check_due(
-            now,
-            now - 7 * DAY,
-            UpdateFrequency::Weekly
-        ));
-
-        assert!(!update_check_due(
-            now,
-            now - 29 * DAY,
-            UpdateFrequency::Monthly
-        ));
-        assert!(update_check_due(
-            now,
-            now - 30 * DAY,
-            UpdateFrequency::Monthly
-        ));
-    }
-
-    #[test]
-    fn update_check_is_due_when_the_last_check_is_in_the_future() {
-        // 時計が巻き戻ると前回時刻が未来になり、そのままでは確認が止まり続ける。
-        let now = 1_000_000;
-        assert!(update_check_due(now, now + 60, UpdateFrequency::Daily));
+    fn settings_saved_by_older_versions_keep_their_values() {
+        // v0.1.13以前は updateFrequency を保存していた。読み込みに失敗すると全設定が既定値に戻るため、
+        // 廃止した項目が残っていても他の値を保てることを確認する。
+        let saved = br#"{
+            "displayMode": "circle",
+            "refreshIntervalSeconds": 900,
+            "codexThreshold": 20,
+            "claudeThreshold": 30,
+            "remainingNotificationsEnabled": false,
+            "resetNotificationsEnabled": false,
+            "codexEnabled": true,
+            "claudeEnabled": false,
+            "launchAtLogin": false,
+            "updateFrequency": "weekly"
+        }"#;
+        let settings: Settings = serde_json::from_slice(saved).expect("older settings must load");
+        assert_eq!(settings.display_mode, DisplayMode::Circle);
+        assert_eq!(settings.refresh_interval_seconds, 900);
+        assert_eq!(settings.codex_threshold, 20);
+        assert_eq!(settings.claude_threshold, 30);
+        assert!(!settings.remaining_notifications_enabled);
+        assert!(!settings.claude_enabled);
+        assert!(!settings.launch_at_login);
     }
 }
