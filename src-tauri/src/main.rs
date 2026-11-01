@@ -311,13 +311,7 @@ fn main() {
 
             refresh(app.handle().clone());
             start_periodic_refresh(app.handle().clone());
-            // 設定の確認頻度に達していれば自動更新チェックを実行。
-            if now_epoch().saturating_sub(read_last_update_check())
-                >= settings.update_frequency.seconds()
-            {
-                write_last_update_check(now_epoch());
-                check_for_update(app.handle().clone());
-            }
+            start_periodic_update_check(app.handle().clone());
             if show_settings_on_launch {
                 show_settings_window(app.handle());
             }
@@ -325,6 +319,34 @@ fn main() {
         })
         .run(tauri::generate_context!())
         .expect("failed to run UsageBar");
+}
+
+/// 常駐中に「設定の確認頻度を過ぎたか」を判定する間隔。
+/// 判定は時刻の比較だけで、実際の更新確認は頻度を過ぎたときにしか行わない。
+const UPDATE_CHECK_POLL_SECONDS: u64 = 60 * 60;
+
+fn update_check_due(now: u64, last_checked: u64, frequency: UpdateFrequency) -> bool {
+    // 時計の巻き戻りで前回時刻が未来になった場合も、確認が止まり続けないよう対象にする。
+    last_checked > now || now - last_checked >= frequency.seconds()
+}
+
+/// 起動直後と、その後は常駐中に1時間ごと、確認頻度に達していれば自動更新チェックを実行。
+fn start_periodic_update_check(app: AppHandle) {
+    std::thread::spawn(move || {
+        loop {
+            let frequency = app
+                .state::<SharedState>()
+                .lock()
+                .expect("monitor state lock poisoned")
+                .update_frequency;
+            let now = now_epoch();
+            if update_check_due(now, read_last_update_check(), frequency) {
+                write_last_update_check(now);
+                check_for_update(app.clone());
+            }
+            std::thread::sleep(Duration::from_secs(UPDATE_CHECK_POLL_SECONDS));
+        }
+    });
 }
 
 fn check_for_update(app: AppHandle) {
@@ -1886,5 +1908,50 @@ mod tests {
         check_threshold("Claude", Some(0), 0, &mut notified, &mut out);
         assert_eq!(out.len(), 1);
         assert!(notified);
+    }
+
+    #[test]
+    fn update_check_is_due_once_the_selected_frequency_has_elapsed() {
+        const DAY: u64 = 24 * 60 * 60;
+        let now = 100 * DAY;
+
+        // 一度も確認していなければ、すぐに確認する。
+        assert!(update_check_due(now, 0, UpdateFrequency::Daily));
+
+        assert!(!update_check_due(
+            now,
+            now - DAY + 1,
+            UpdateFrequency::Daily
+        ));
+        assert!(update_check_due(now, now - DAY, UpdateFrequency::Daily));
+
+        assert!(!update_check_due(
+            now,
+            now - 6 * DAY,
+            UpdateFrequency::Weekly
+        ));
+        assert!(update_check_due(
+            now,
+            now - 7 * DAY,
+            UpdateFrequency::Weekly
+        ));
+
+        assert!(!update_check_due(
+            now,
+            now - 29 * DAY,
+            UpdateFrequency::Monthly
+        ));
+        assert!(update_check_due(
+            now,
+            now - 30 * DAY,
+            UpdateFrequency::Monthly
+        ));
+    }
+
+    #[test]
+    fn update_check_is_due_when_the_last_check_is_in_the_future() {
+        // 時計が巻き戻ると前回時刻が未来になり、そのままでは確認が止まり続ける。
+        let now = 1_000_000;
+        assert!(update_check_due(now, now + 60, UpdateFrequency::Daily));
     }
 }
