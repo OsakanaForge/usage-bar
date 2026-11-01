@@ -142,7 +142,6 @@ struct MonitorState {
     claude_notified: bool,
     codex_enabled: bool,
     claude_enabled: bool,
-    update_frequency: UpdateFrequency,
     five_hour_reset_label: Option<String>,
     seven_day_reset_label: Option<String>,
 }
@@ -155,25 +154,6 @@ enum DisplayMode {
     #[default]
     Number,
     Circle,
-}
-
-#[derive(Clone, Copy, Debug, Default, Deserialize, PartialEq, Serialize)]
-#[serde(rename_all = "camelCase")]
-enum UpdateFrequency {
-    #[default]
-    Daily,
-    Weekly,
-    Monthly,
-}
-
-impl UpdateFrequency {
-    fn seconds(self) -> u64 {
-        match self {
-            UpdateFrequency::Daily => 24 * 60 * 60,
-            UpdateFrequency::Weekly => 7 * 24 * 60 * 60,
-            UpdateFrequency::Monthly => 30 * 24 * 60 * 60,
-        }
-    }
 }
 
 const ALLOWED_REFRESH_INTERVALS: [u64; 5] = [5 * 60, 10 * 60, 15 * 60, 20 * 60, 30 * 60];
@@ -198,7 +178,6 @@ struct Settings {
     codex_enabled: bool,
     claude_enabled: bool,
     launch_at_login: bool,
-    update_frequency: UpdateFrequency,
 }
 
 #[derive(Serialize)]
@@ -220,7 +199,6 @@ impl Default for Settings {
             codex_enabled: true,
             claude_enabled: true,
             launch_at_login: true,
-            update_frequency: UpdateFrequency::Daily,
         }
     }
 }
@@ -288,7 +266,6 @@ fn main() {
                 reset_notifications_enabled: settings.reset_notifications_enabled,
                 codex_enabled: settings.codex_enabled,
                 claude_enabled: settings.claude_enabled,
-                update_frequency: settings.update_frequency,
                 ..MonitorState::default()
             }));
             app.manage(state.clone());
@@ -321,30 +298,15 @@ fn main() {
         .expect("failed to run UsageBar");
 }
 
-/// 常駐中に「設定の確認頻度を過ぎたか」を判定する間隔。
-/// 判定は時刻の比較だけで、実際の更新確認は頻度を過ぎたときにしか行わない。
-const UPDATE_CHECK_POLL_SECONDS: u64 = 60 * 60;
+/// 自動更新チェックの間隔。確認は latest.json（約1KB）の取得だけで、新しい版があるときだけダウンロードする。
+const UPDATE_CHECK_INTERVAL_SECONDS: u64 = 60 * 60;
 
-fn update_check_due(now: u64, last_checked: u64, frequency: UpdateFrequency) -> bool {
-    // 時計の巻き戻りで前回時刻が未来になった場合も、確認が止まり続けないよう対象にする。
-    last_checked > now || now - last_checked >= frequency.seconds()
-}
-
-/// 起動直後と、その後は常駐中に1時間ごと、確認頻度に達していれば自動更新チェックを実行。
+/// 起動直後と、その後は常駐中に1時間ごとに自動更新チェックを実行。
 fn start_periodic_update_check(app: AppHandle) {
     std::thread::spawn(move || {
         loop {
-            let frequency = app
-                .state::<SharedState>()
-                .lock()
-                .expect("monitor state lock poisoned")
-                .update_frequency;
-            let now = now_epoch();
-            if update_check_due(now, read_last_update_check(), frequency) {
-                write_last_update_check(now);
-                check_for_update(app.clone());
-            }
-            std::thread::sleep(Duration::from_secs(UPDATE_CHECK_POLL_SECONDS));
+            check_for_update(app.clone());
+            std::thread::sleep(Duration::from_secs(UPDATE_CHECK_INTERVAL_SECONDS));
         }
     });
 }
@@ -1299,7 +1261,6 @@ fn get_settings(app: AppHandle, state: tauri::State<'_, SharedState>) -> Setting
         codex_enabled: current.codex_enabled,
         claude_enabled: current.claude_enabled,
         launch_at_login: launch_at_login_enabled(&app),
-        update_frequency: current.update_frequency,
     }
 }
 
@@ -1340,7 +1301,6 @@ fn set_settings(
         current.reset_notifications_enabled = settings.reset_notifications_enabled;
         current.codex_enabled = settings.codex_enabled;
         current.claude_enabled = settings.claude_enabled;
-        current.update_frequency = settings.update_frequency;
         apply_launch_at_login(&app, settings.launch_at_login);
         // 無効化されたサービスの表示値は即座にクリアする。
         if let Some(snapshot) = current.latest.as_mut() {
@@ -1476,29 +1436,6 @@ fn write_private_atomic(path: &Path, data: &[u8]) -> std::io::Result<()> {
         let _ = std::fs::remove_file(&temporary);
     }
     result
-}
-
-fn last_update_check_path() -> Option<PathBuf> {
-    env::var_os("HOME").map(|home| {
-        PathBuf::from(home).join("Library/Application Support/UsageBar/last-update-check")
-    })
-}
-
-fn read_last_update_check() -> u64 {
-    last_update_check_path()
-        .and_then(|path| std::fs::read_to_string(path).ok())
-        .and_then(|text| text.trim().parse::<u64>().ok())
-        .unwrap_or(0)
-}
-
-fn write_last_update_check(timestamp: u64) {
-    let Some(path) = last_update_check_path() else {
-        return;
-    };
-    if let Some(directory) = path.parent() {
-        let _ = std::fs::create_dir_all(directory);
-    }
-    let _ = std::fs::write(path, timestamp.to_string());
 }
 
 /// 任意のUTF-8文字列をPOSIX shellの単一引数として安全に引用する。
@@ -1911,47 +1848,28 @@ mod tests {
     }
 
     #[test]
-    fn update_check_is_due_once_the_selected_frequency_has_elapsed() {
-        const DAY: u64 = 24 * 60 * 60;
-        let now = 100 * DAY;
-
-        // 一度も確認していなければ、すぐに確認する。
-        assert!(update_check_due(now, 0, UpdateFrequency::Daily));
-
-        assert!(!update_check_due(
-            now,
-            now - DAY + 1,
-            UpdateFrequency::Daily
-        ));
-        assert!(update_check_due(now, now - DAY, UpdateFrequency::Daily));
-
-        assert!(!update_check_due(
-            now,
-            now - 6 * DAY,
-            UpdateFrequency::Weekly
-        ));
-        assert!(update_check_due(
-            now,
-            now - 7 * DAY,
-            UpdateFrequency::Weekly
-        ));
-
-        assert!(!update_check_due(
-            now,
-            now - 29 * DAY,
-            UpdateFrequency::Monthly
-        ));
-        assert!(update_check_due(
-            now,
-            now - 30 * DAY,
-            UpdateFrequency::Monthly
-        ));
-    }
-
-    #[test]
-    fn update_check_is_due_when_the_last_check_is_in_the_future() {
-        // 時計が巻き戻ると前回時刻が未来になり、そのままでは確認が止まり続ける。
-        let now = 1_000_000;
-        assert!(update_check_due(now, now + 60, UpdateFrequency::Daily));
+    fn settings_saved_by_older_versions_keep_their_values() {
+        // v0.1.13以前は updateFrequency を保存していた。読み込みに失敗すると全設定が既定値に戻るため、
+        // 廃止した項目が残っていても他の値を保てることを確認する。
+        let saved = br#"{
+            "displayMode": "circle",
+            "refreshIntervalSeconds": 900,
+            "codexThreshold": 20,
+            "claudeThreshold": 30,
+            "remainingNotificationsEnabled": false,
+            "resetNotificationsEnabled": false,
+            "codexEnabled": true,
+            "claudeEnabled": false,
+            "launchAtLogin": false,
+            "updateFrequency": "weekly"
+        }"#;
+        let settings: Settings = serde_json::from_slice(saved).expect("older settings must load");
+        assert_eq!(settings.display_mode, DisplayMode::Circle);
+        assert_eq!(settings.refresh_interval_seconds, 900);
+        assert_eq!(settings.codex_threshold, 20);
+        assert_eq!(settings.claude_threshold, 30);
+        assert!(!settings.remaining_notifications_enabled);
+        assert!(!settings.claude_enabled);
+        assert!(!settings.launch_at_login);
     }
 }
