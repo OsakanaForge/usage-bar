@@ -4452,7 +4452,7 @@ dependencies = [
 
 [[package]]
 name = "usage-bar"
-version = "0.1.13"
+version = "0.1.14"
 dependencies = [
  "objc2-core-foundation",
  "objc2-core-graphics",
